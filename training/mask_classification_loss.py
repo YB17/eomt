@@ -62,6 +62,9 @@ class MaskClassificationLoss(Mask2FormerLoss):
             target["masks"].to(masks_queries_logits.dtype) for target in targets
         ]
         class_labels = [target["labels"].long() for target in targets]
+        # 只用is_thing作为标签，thing=1, stuff=0
+        # class_labels = [target["is_thing"].long() for target in targets]
+
 
         indices = self.matcher(
             masks_queries_logits=masks_queries_logits,

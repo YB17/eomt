@@ -1,0 +1,35 @@
+trainer:
+    max_epochs: 25
+    check_val_every_n_epoch: 5
+    logger:
+      class_path: lightning.pytorch.loggers.wandb.WandbLogger
+      init_args:
+        resume: allow
+        project: "eomt"
+        name: "coco_panoptic_eomt_base_640_coarse"
+
+model:
+    class_path: training.mask_classification_panoptic_coarse.MaskClassificationPanopticCoarse
+    init_args:
+      attn_mask_annealing_enabled: True
+      attn_mask_annealing_start_steps: [15095, 37737, 60380]
+      attn_mask_annealing_end_steps: [30190, 52832, 75475]
+      load_ckpt_class_head: false  # 不加载原来的类别头权重
+      network:
+        class_path: models.eomt.EoMT
+        init_args:
+          num_classes: 2  # 粗粒度：thing(1) + stuff(0)
+          num_q: 200
+          num_blocks: 3
+          encoder:
+            class_path: models.vit.ViT
+            init_args:
+              backbone_name: vit_base_patch14_reg4_dinov2
+              img_size: [640, 640]
+
+data:
+    class_path: datasets.coco_panoptic_directory.COCOPanopticDirectory
+    init_args:
+      stuff_classes: [80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132]
+      batch_size: 8
+      num_workers: 8

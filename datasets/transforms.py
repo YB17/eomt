@@ -94,7 +94,18 @@ class Transforms(nn.Module):
         return img, target
 
     def _filter(self, target: dict[str, Union[Tensor, TVTensor]], keep: Tensor) -> dict:
-        return {k: wrap(v[keep], like=v) for k, v in target.items()}
+        """过滤target字典，跳过非tensor字段"""
+        filtered_target = {}
+        
+        for k, v in target.items():
+            if isinstance(v, (Tensor, TVTensor)):
+                # 只对tensor/TVTensor类型的值应用索引
+                filtered_target[k] = wrap(v[keep], like=v)
+            else:
+                # 对于其他类型（如字符串image_id），直接保留
+                filtered_target[k] = v
+        
+        return filtered_target
 
     def forward(
         self, img: Tensor, target: dict[str, Union[Tensor, TVTensor]]
@@ -112,6 +123,87 @@ class Transforms(nn.Module):
         valid = target["masks"].flatten(1).any(1)
         if not valid.any():
             return self(img_orig, target_orig)
+
+        target = self._filter(target, valid)
+
+        return img, target
+
+class MinimalTransforms(nn.Module):
+    """
+    最小数据变换类 - 用于过拟合小数据集
+    只保留必要的尺寸调整和填充操作，关闭所有数据增强
+    """
+    def __init__(
+        self,
+        img_size: tuple[int, int],
+    ):
+        super().__init__()
+        self.img_size = img_size
+
+    def pad(
+        self, img: Tensor, target: dict[str, Any]
+    ) -> tuple[Tensor, dict[str, Union[Tensor, TVTensor]]]:
+        """只进行必要的填充操作以匹配目标尺寸"""
+        pad_h = max(0, self.img_size[-2] - img.shape[-2])
+        pad_w = max(0, self.img_size[-1] - img.shape[-1])
+        padding = [0, 0, pad_w, pad_h]
+
+        img = F.pad(img, padding)
+        target["masks"] = F.pad(target["masks"], padding)
+
+        return img, target
+
+    def resize_to_target_size(
+        self, img: Tensor, target: dict[str, Any]
+    ) -> tuple[Tensor, dict[str, Union[Tensor, TVTensor]]]:
+        """将图像和目标调整到目标尺寸"""
+        if img.shape[-2:] != self.img_size:
+            # 使用双线性插值调整图像尺寸
+            img = F.resize(img, self.img_size, interpolation=F.InterpolationMode.BILINEAR)
+            # 使用最近邻插值调整mask尺寸以保持标签的准确性
+            target["masks"] = F.resize(
+                target["masks"], 
+                self.img_size, 
+                interpolation=F.InterpolationMode.NEAREST
+            )
+        
+        return img, target
+
+    def _filter(self, target: dict[str, Union[Tensor, TVTensor]], keep: Tensor) -> dict:
+        """过滤target字典，跳过非tensor字段"""
+        filtered_target = {}
+        
+        for k, v in target.items():
+            if isinstance(v, (Tensor, TVTensor)):
+                # 只对tensor/TVTensor类型的值应用索引
+                filtered_target[k] = wrap(v[keep], like=v)
+            else:
+                # 对于其他类型（如字符串image_id），直接保留
+                filtered_target[k] = v
+        
+        return filtered_target
+
+    def forward(
+        self, img: Tensor, target: dict[str, Union[Tensor, TVTensor]]
+    ) -> tuple[Tensor, dict[str, Union[Tensor, TVTensor]]]:
+        """
+        前向传播 - 只进行必要的尺寸调整
+        不进行任何随机数据增强操作
+        """
+        # 过滤掉crowd标注
+        target = self._filter(target, ~target["is_crowd"])
+        
+        # 调整到目标尺寸
+        img, target = self.resize_to_target_size(img, target)
+        
+        # 如果需要的话进行填充
+        img, target = self.pad(img, target)
+        
+        # 检查是否有有效的mask
+        valid = target["masks"].flatten(1).any(1)
+        if not valid.any():
+            # 如果没有有效mask，返回原始数据（这种情况在小数据集中应该很少见）
+            return img, target
 
         target = self._filter(target, valid)
 

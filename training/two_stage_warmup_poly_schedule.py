@@ -6,7 +6,12 @@
 
 from torch.optim.lr_scheduler import LRScheduler
 
-
+'''
+双阶段 Warmup：先让 head（新加层） warmup，再打开 backbone 的训练，并给 backbone 设定自己的 warmup 时长。
+层级保护：backbone 在 head 达到一定稳定后才开始微调。
+统一多项式衰减：两个阶段结束后，head/backbone 都进入自己的多项式衰减期，最后 lr → 0。
+这样既加快了 head 的收敛，也保留了对预训练 backbone 的稳定保护，提升整体训练效率与最终性能。
+'''
 class TwoStageWarmupPolySchedule(LRScheduler):
     def __init__(
         self,

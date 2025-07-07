@@ -14,7 +14,7 @@ import logging
 import torch
 import warnings
 from lightning.pytorch import cli
-from lightning.pytorch.callbacks import ModelSummary, LearningRateMonitor
+from lightning.pytorch.callbacks import ModelSummary, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loops.training_epoch_loop import _TrainingEpochLoop
 from lightning.pytorch.loops.fetchers import _DataFetcher, _DataLoaderIterDataFetcher
 
@@ -167,6 +167,12 @@ def cli_main():
             "callbacks": [
                 ModelSummary(max_depth=3),
                 LearningRateMonitor(logging_interval="epoch"),
+                ModelCheckpoint(
+                    save_top_k=-1,  # 保存所有checkpoint
+                    every_n_epochs=5,  # 每5个epoch保存一次
+                    filename="epoch-{epoch:03d}",  # 文件名格式
+                    save_last=True,  # 同时保存最后一个checkpoint
+                ),
             ],
             "devices": 1,
             "gradient_clip_val": 0.01,
@@ -177,3 +183,11 @@ def cli_main():
 
 if __name__ == "__main__":
     cli_main()
+
+'''
+python3 main.py fit \
+  -c configs/coco/panoptic/eomt_base_640_dir.yaml \
+  --trainer.devices 4 \
+  --data.batch_size 4 \
+  --data.path /home/host_ssd/coconut_dataset/coco
+'''
