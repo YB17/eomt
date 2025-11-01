@@ -1,0 +1,18 @@
+[project]
+name = "eomt"
+version = "0.0.0"
+description = "Encoder-only Mask Transformer"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+ov = [
+    "peft>=0.11.0",
+    "transformers>=4.43.0",
+    "accelerate>=0.33.0",
+    "sentencepiece",
+]
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"

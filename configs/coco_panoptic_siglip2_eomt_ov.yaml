@@ -1,0 +1,50 @@
+MODEL:
+  BACKBONE:
+    NAME: siglip2_vit_b_16_naflex
+    MODEL_ID: "<SIGLIP2_MODEL_ID>"
+    DROP_PATH: 0.1
+    NAFLEX: true
+    LORA:
+      ENABLED: true
+      RANK: 8
+      ALPHA: 16
+      TARGET: ["q_proj", "k_proj", "v_proj"]
+      LAYERS_LAST_N: 8
+  HEAD:
+    TYPE: EoMT
+    NUM_QUERIES: 150
+    MASK_PROJ_DIM: ${MODEL.BACKBONE.EMBED_DIM}
+  OPEN_VOCAB:
+    ENABLED: true
+    TEXT_MODEL_ID: "<SIGLIP2_TEXT_ID>"
+    MULTILINGUAL: false
+    FUSE_CLOSED_HEAD: false
+    TEMP: 0.02
+    CALIBRATION_BIAS: 0.0
+LOSS:
+  MATCH:
+    LAMBDA_MASK_IOU: 2.0
+    LAMBDA_BCE: 2.0
+    LAMBDA_CLS: 1.0
+  OV:
+    KL_WEIGHT: 0.5
+  DISTILL:
+    FEAT_ALIGN: 0.001
+    ITC_WEIGHT: 0.05
+DATA:
+  DATASET: coco_panoptic
+  ROOT: "<DATA_ROOT>"
+  TRAIN_SPLIT: train2017
+  VAL_SPLIT: val2017
+  TRAIN_RES_MIN: 640
+  TRAIN_RES_MAX: 1024
+SOLVER:
+  OPTIM: AdamW
+  LR_HEAD: 5e-4
+  LR_LORA: 1e-4
+  WD: 0.05
+  STEPS: 120000
+TEST:
+  EVAL_PQ: true
+  OV_SPLIT: "ovp_val"
+OUTPUT_DIR: "<OUTPUT_DIR>"
