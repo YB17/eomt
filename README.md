@@ -33,6 +33,7 @@ Then create the environment, activate it, and install the dependencies:
 conda create -n eomt python==3.13.2
 conda activate eomt
 python3 -m pip install -r requirements.txt
+python3 -m pip install -r requirements_extra.txt
 ```
 
 [Weights & Biases](https://wandb.ai/) (wandb) is used for experiment logging and visualization. To enable wandb, log in to your account:
@@ -126,6 +127,71 @@ This command evaluates the same `EoMT-L` model using 4 GPUs with a batch size of
 🔧 Replace `/path/to/pytorch_model.bin` with the path to the checkpoint to evaluate.
 
 A [notebook](inference.ipynb) is available for quick inference and visualization with auto-downloaded pre-trained models.
+
+## SigLIP2-EoMT-OVPanoptic
+
+The SigLIP2 variant keeps the encoder-only Mask Transformer philosophy while replacing the original ViT backbone with a SigLIP2 vision tower. The pipeline is still a single-stack transformer: image patches and learnable queries are tokenised together, self-attended end-to-end, and decoded into masks without any task-specific decoder. On top of the final query features we attach two heads:
+
+* a light-weight mask head that projects queries back to the patch grid (identical to vanilla EoMT), and
+* an open-vocabulary classifier that pools visual evidence inside each predicted mask and measures cosine similarity against SigLIP2 text embeddings.
+
+### Three-stage recipe
+
+1. **Stage A – Frozen backbone warm-up.** Train only the query/mask heads. This stabilises optimisation when the SigLIP2 tower remains frozen. Recommended hyperparameters:
+   * `LR_HEAD = 5e-4`, `WD = 0.05`
+   * 30k–40k steps with random-res 640–1024 crops.
+2. **Stage B – LoRA fine-tuning.** Activate LoRA adapters on the last 8 transformer blocks (rank 8 for Q/K/V by default). Suggested LR for LoRA parameters: `1e-4`.
+3. **Optional Stage C – Wider adapters.** Increase LoRA rank (e.g. 16) and extend to FFN layers when domain shift requires extra capacity.
+
+### Prompt templates & synonyms
+
+We follow CLIP-style prompt engineering. English templates:
+
+```
+a photo of a {}.
+a {} in the scene.
+```
+
+Stuff categories use contextual prompts such as `a patch of {}` or `the {} background`. Synonyms help recover alternative phrasings, e.g. `"cell phone" → ["mobile phone", "smartphone"]`, `"couch" → ["sofa"]`. When `OPEN_VOCAB.MULTILINGUAL=true`, the head concatenates Mandarin templates like `"一张关于{}的照片。"` to the prompt set.
+
+### Resource footprint
+
+* **Stage A (frozen backbone):** ~14–16 GB per 512×512 batch of four on modern GPUs.
+* **Stage B (LoRA rank 8):** +1.5 GB compared to Stage A.
+* **Stage B (LoRA rank 16 + FFN):** +3–3.5 GB with a minor throughput drop (~5%).
+
+### Frequently asked questions
+
+* **Why “NAFlex”?** SigLIP2 ships MAP pooling by default. We bypass that head and interpolate positional encodings so arbitrary resolutions (e.g. 640–1024) remain valid.
+* **Which layers receive LoRA?** By default only Q/K/V in the last eight blocks. Extending to FFN is exposed via `MODEL.BACKBONE.LORA.TARGET`.
+* **Stuff taxonomy looks noisy.** You can tailor templates or synonyms in `eomt/data/coco_ov_vocab.py`.
+* **Logit calibration.** Use `OPEN_VOCAB.TEMP` and `OPEN_VOCAB.CALIBRATION_BIAS` to tune similarity scores at validation time.
+
+### Training & evaluation commands
+
+```bash
+# Stage A – frozen tower warm-up
+python tools/train_net.py \
+  --config-file configs/coco_panoptic_siglip2_eomt_ov.yaml \
+  MODEL.BACKBONE.LORA.ENABLED false \
+  OUTPUT_DIR runs/coco_eomt_siglip2_ov/stageA
+
+# Stage B – LoRA finetuning
+python tools/train_net.py \
+  --config-file configs/coco_panoptic_siglip2_eomt_ov.yaml \
+  MODEL.BACKBONE.LORA.ENABLED true \
+  MODEL.BACKBONE.LORA.RANK 8 \
+  MODEL.BACKBONE.LORA.LAYERS_LAST_N 8 \
+  OUTPUT_DIR runs/coco_eomt_siglip2_ov/stageB
+
+# Validation
+python tools/test_net.py \
+  --config-file configs/coco_panoptic_siglip2_eomt_ov.yaml \
+  OUTPUT_DIR runs/coco_eomt_siglip2_ov/eval
+
+# Smoke test for the SigLIP2 + Open-Vocab stack
+pytest -q tests/test_siglip2_ov.py
+```
 
 ## Model Zoo
 
@@ -312,3 +378,32 @@ This project builds upon code from the following libraries and repositories:
 - [TorchMetrics](https://github.com/Lightning-AI/torchmetrics) (Apache-2.0 License)  
 - [Mask2Former](https://github.com/facebookresearch/Mask2Former) (Apache-2.0 License)
 - [Detectron2](https://github.com/facebookresearch/detectron2) (Apache-2.0 License)
+
+### 可复制的一键运行示例命令（贴到 README 的最后）
+
+```bash
+# 0) 安装
+pip install -r requirements.txt
+pip install -r requirements_extra.txt
+
+# 1) 冻塔热身（Stage A）
+python tools/train_net.py \
+  --config-file configs/coco_panoptic_siglip2_eomt_ov.yaml \
+  MODEL.BACKBONE.LORA.ENABLED false \
+  OUTPUT_DIR <OUTPUT_DIR>/stageA
+
+# 2) LoRA 微调（Stage B）
+python tools/train_net.py \
+  --config-file configs/coco_panoptic_siglip2_eomt_ov.yaml \
+  MODEL.BACKBONE.LORA.ENABLED true \
+  MODEL.BACKBONE.LORA.RANK 8 \
+  MODEL.BACKBONE.LORA.LAYERS_LAST_N 8 \
+  LOSS.DISTILL.FEAT_ALIGN 0.001 \
+  LOSS.DISTILL.ITC_WEIGHT 0.05 \
+  OUTPUT_DIR <OUTPUT_DIR>/stageB
+
+# 3) 验证
+python tools/test_net.py \
+  --config-file configs/coco_panoptic_siglip2_eomt_ov.yaml \
+  OUTPUT_DIR <OUTPUT_DIR>/eval
+```

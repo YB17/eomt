@@ -6,13 +6,14 @@
 # used under the Apache 2.0 License.
 # ---------------------------------------------------------------
 
-from typing import Optional
+from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 
 from models.scale_block import ScaleBlock
+from .open_vocab_head import OpenVocabHead
 
 
 class EoMT(nn.Module):
@@ -23,12 +24,16 @@ class EoMT(nn.Module):
         num_q,
         num_blocks=4,
         masked_attn_enabled=True,
+        open_vocab_head: Optional[OpenVocabHead] = None,
+        fuse_closed_head: bool = False,
     ):
         super().__init__()
         self.encoder = encoder
         self.num_q = num_q
         self.num_blocks = num_blocks
         self.masked_attn_enabled = masked_attn_enabled
+        self.open_vocab_head = open_vocab_head
+        self.fuse_closed_head = fuse_closed_head
 
         self.register_buffer("attn_mask_probs", torch.ones(num_blocks))
 
@@ -107,7 +112,7 @@ class EoMT(nn.Module):
 
         return x
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> Dict[str, List[torch.Tensor]]:
         x = (x - self.encoder.pixel_mean) / self.encoder.pixel_std
 
         x = self.encoder.backbone.patch_embed(x)
@@ -117,6 +122,7 @@ class EoMT(nn.Module):
 
         attn_mask = None
         mask_logits_per_layer, class_logits_per_layer = [], []
+        backbone_tokens_per_layer: List[torch.Tensor] = []
 
         for i, block in enumerate(self.encoder.backbone.blocks):
             if i == len(self.encoder.backbone.blocks) - self.num_blocks:
@@ -128,9 +134,11 @@ class EoMT(nn.Module):
                 self.masked_attn_enabled
                 and i >= len(self.encoder.backbone.blocks) - self.num_blocks
             ):
-                mask_logits, class_logits = self._predict(self.encoder.backbone.norm(x))
+                norm_tokens = self.encoder.backbone.norm(x)
+                mask_logits, class_logits = self._predict(norm_tokens)
                 mask_logits_per_layer.append(mask_logits)
                 class_logits_per_layer.append(class_logits)
+                backbone_tokens_per_layer.append(norm_tokens)
 
                 attn_mask = torch.ones(
                     x.shape[0],
@@ -166,11 +174,33 @@ class EoMT(nn.Module):
             )
             x = x + block.drop_path2(block.ls2(block.mlp(block.norm2(x))))
 
-        mask_logits, class_logits = self._predict(self.encoder.backbone.norm(x))
+        norm_tokens = self.encoder.backbone.norm(x)
+        mask_logits, class_logits = self._predict(norm_tokens)
         mask_logits_per_layer.append(mask_logits)
         class_logits_per_layer.append(class_logits)
+        outputs: Dict[str, List[torch.Tensor]] = {
+            "mask_logits": mask_logits_per_layer,
+            "class_logits": class_logits_per_layer,
+        }
+        backbone_tokens_per_layer.append(norm_tokens)
+        outputs["backbone_tokens"] = backbone_tokens_per_layer
 
-        return (
-            mask_logits_per_layer,
-            class_logits_per_layer,
-        )
+        if self.open_vocab_head is not None:
+            patch_tokens = norm_tokens[
+                :,
+                self.num_q + self.encoder.backbone.num_prefix_tokens :,
+                :,
+            ]
+            ov_logits, ov_sims = self.open_vocab_head(mask_logits, patch_tokens)
+            if (
+                self.fuse_closed_head
+                and class_logits is not None
+                and class_logits.shape[-1] - 1 == ov_logits.shape[-1]
+            ):
+                fused = 0.5 * (ov_logits + class_logits[..., :-1])
+                outputs["fused_logits"] = [fused]
+            outputs["open_vocab_logits"] = [ov_logits]
+            outputs["open_vocab_sims"] = [ov_sims]
+            outputs["patch_tokens"] = [patch_tokens]
+
+        return outputs

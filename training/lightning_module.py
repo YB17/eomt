@@ -35,6 +35,7 @@ from torchvision.transforms.v2.functional import pad
 import cv2
 
 from training.two_stage_warmup_poly_schedule import TwoStageWarmupPolySchedule
+from engine.distill import compute_feat_align, compute_itc
 
 bold_green = "\033[1;32m"
 reset = "\033[0m"
@@ -56,6 +57,10 @@ class LightningModule(lightning.LightningModule):
         warmup_steps: tuple[int, int],
         ckpt_path=None,
         load_ckpt_class_head=True,
+        distill_feat_weight: float = 0.0,
+        distill_itc_weight: float = 0.0,
+        distill_temperature: float = 0.07,
+        teacher_backbone: Optional[nn.Module] = None,
     ):
         super().__init__()
 
@@ -72,6 +77,14 @@ class LightningModule(lightning.LightningModule):
         self.warmup_steps = warmup_steps
 
         self.strict_loading = False
+        self.distill_feat_weight = distill_feat_weight
+        self.distill_itc_weight = distill_itc_weight
+        self.distill_temperature = distill_temperature
+        self.teacher_backbone = teacher_backbone
+        if self.teacher_backbone is not None:
+            self.teacher_backbone.eval()
+            for param in self.teacher_backbone.parameters():
+                param.requires_grad_(False)
 
         if ckpt_path:
             ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=True)
@@ -177,7 +190,9 @@ class LightningModule(lightning.LightningModule):
             img_sizes = [img.shape[-2:] for img in imgs]
             crops, origins = model.window_imgs_semantic(imgs)
 
-            mask_logits_per_layer, class_logits_per_layer = model(crops)
+            outputs = model(crops)
+            mask_logits_per_layer = outputs["mask_logits"]
+            class_logits_per_layer = outputs["class_logits"]
             mask_logits = F.interpolate(mask_logits_per_layer[-1], data.img_size, mode="bilinear")
 
             crop_logits = model.to_per_pixel_logits_semantic(
@@ -207,8 +222,13 @@ class LightningModule(lightning.LightningModule):
         # 获取输入图像和目标
         imgs, targets = batch
 
-        # 前向传播，获取 mask_logits_per_block 和 class_logits_per_block
-        mask_logits_per_block, class_logits_per_block = self(imgs)
+        outputs = self(imgs)
+        mask_logits_per_block = outputs["mask_logits"]
+        class_logits_per_block = outputs.get("class_logits", [])
+        if not class_logits_per_block and outputs.get("fused_logits"):
+            class_logits_per_block = outputs["fused_logits"]
+        open_vocab_logits_per_block = outputs.get("open_vocab_logits")
+        text_priors_per_block = outputs.get("open_vocab_sims")
 
         # 初始化损失字典
         losses_all_blocks = {}
@@ -218,32 +238,81 @@ class LightningModule(lightning.LightningModule):
             list(zip(mask_logits_per_block, class_logits_per_block))
         ):
             # 计算损失
+            ov_logits = None
+            text_priors = None
+            if open_vocab_logits_per_block:
+                ov_logits = open_vocab_logits_per_block[min(i, len(open_vocab_logits_per_block) - 1)]
+            if text_priors_per_block:
+                text_priors = text_priors_per_block[min(i, len(text_priors_per_block) - 1)]
+            if i != len(mask_logits_per_block) - 1:
+                ov_logits = None
+                text_priors = None
             losses = self.criterion(
                 masks_queries_logits=mask_logits,
                 class_queries_logits=class_logits,
                 targets=targets,
+                open_vocab_logits=ov_logits,
+                text_priors=text_priors,
             )
 
             # 添加 block 后缀
             block_postfix = self.block_postfix(i)
             losses = {f"{key}{block_postfix}": value for key, value in losses.items()}
             losses_all_blocks |= losses
-        
-        # 在训练时每隔一定步数可视化一张图像（避免太频繁影响训练速度）
-        # if batch_idx % 5 == 0:  # 改为每500个batch可视化一次，或者完全禁用
-        #     self.plot_panoptic(
-        #         img=imgs[0],  # 第一张图像
-        #         targets=targets[0],  # 对应的target
-        #         mask_logits=mask_logits_per_block[-1][0],  # 最后一个block的第一张图像的mask logits
-        #         class_logits=class_logits_per_block[-1][0],  # 最后一个block的第一张图像的class logits
-        #         log_prefix="train",
-        #         block_idx=len(mask_logits_per_block) - 1,  # 最后一个block
-        #         batch_idx=batch_idx,
-        #     )
-            # [0.2T, 0.5T, 0.8T] = [40, 100, 160]
-            # [0.4T, 0.7T, 1.0T] = [80, 140, 200]
-        
-        return self.criterion.loss_total(losses_all_blocks, self.log)
+
+        loss_total = self.criterion.loss_total(losses_all_blocks, self.log)
+
+        extra_losses = {}
+        if self.distill_feat_weight > 0 and self.teacher_backbone is not None:
+            with torch.no_grad():
+                teacher_inputs = imgs / 255.0
+                pixel_mean = getattr(
+                    self.teacher_backbone,
+                    "pixel_mean",
+                    torch.zeros(1, teacher_inputs.size(1), 1, 1, device=teacher_inputs.device, dtype=teacher_inputs.dtype),
+                )
+                pixel_std = getattr(
+                    self.teacher_backbone,
+                    "pixel_std",
+                    torch.ones(1, teacher_inputs.size(1), 1, 1, device=teacher_inputs.device, dtype=teacher_inputs.dtype),
+                )
+                teacher_inputs = (teacher_inputs - pixel_mean.to(teacher_inputs.device)) / pixel_std.to(teacher_inputs.device)
+                dtype = next(self.teacher_backbone.parameters()).dtype
+                teacher_feats = self.teacher_backbone.forward_features(teacher_inputs.to(dtype=dtype))
+            student_feats = outputs.get("backbone_tokens", [])
+            if student_feats:
+                teacher_selected = teacher_feats[-len(student_feats):]
+                if teacher_selected:
+                    student_selected = student_feats[-len(teacher_selected):]
+                    extra_losses["distill_feat_align"] = compute_feat_align(student_selected, teacher_selected, self.distill_feat_weight)
+
+        if (
+            self.distill_itc_weight > 0
+            and getattr(self.network, "open_vocab_head", None) is not None
+            and outputs.get("patch_tokens")
+        ):
+            patch_tokens = outputs["patch_tokens"][-1]
+            image_embs = patch_tokens.mean(dim=1)
+            text_features = self.network.open_vocab_head.text_features.to(image_embs.device)
+            paired_text = []
+            paired_imgs = []
+            for img_idx, target in enumerate(targets):
+                if target["labels"].numel() == 0:
+                    continue
+                label_id = int(target["labels"][0].item())
+                if label_id < text_features.shape[0]:
+                    paired_text.append(text_features[label_id])
+                    paired_imgs.append(image_embs[img_idx])
+            if paired_text:
+                text_embs = torch.stack(paired_text)
+                img_embs = torch.stack(paired_imgs[: len(paired_text)])
+                extra_losses["distill_itc"] = compute_itc(img_embs, text_embs, self.distill_temperature, self.distill_itc_weight)
+
+        for key, value in extra_losses.items():
+            self.log(f"losses/train_{key}", value, sync_dist=True)
+            loss_total = loss_total + value
+
+        return loss_total
 
     def validation_step(self, batch, batch_idx=0):
         return self.eval_step(batch, batch_idx, "val")
@@ -831,9 +900,22 @@ class LightningModule(lightning.LightningModule):
         return logits
 
     def to_per_pixel_preds_panoptic(
-        self, mask_logits_list, class_logits, stuff_classes, mask_thresh, overlap_thresh
+        self,
+        mask_logits_list,
+        class_logits,
+        stuff_classes,
+        mask_thresh,
+        overlap_thresh,
+        open_vocab_logits=None,
     ):
-        scores, classes = class_logits.softmax(dim=-1).max(-1)
+        class_probs = class_logits.softmax(dim=-1)
+        closed_scores, closed_classes = class_probs.max(-1)
+        if open_vocab_logits is not None:
+            ov_probs = open_vocab_logits.softmax(dim=-1)
+            ov_scores, ov_classes = ov_probs.max(-1)
+        else:
+            ov_scores = None
+            ov_classes = None
         preds_list = []
 
         for i in range(len(mask_logits_list)):
@@ -844,7 +926,15 @@ class LightningModule(lightning.LightningModule):
             )
             preds[:, :, 0] = self.num_classes
 
-            keep = classes[i].ne(class_logits.shape[-1] - 1) & (scores[i] > mask_thresh)
+            if ov_scores is not None and ov_classes is not None:
+                class_ids = ov_classes[i]
+                class_scores = ov_scores[i]
+                keep = class_scores > mask_thresh
+                keep = keep & closed_classes[i].ne(class_logits.shape[-1] - 1)
+            else:
+                class_ids = closed_classes[i]
+                class_scores = closed_scores[i]
+                keep = class_ids.ne(class_logits.shape[-1] - 1) & (class_scores > mask_thresh)
             if not keep.any():
                 preds_list.append(preds)
                 continue
@@ -856,11 +946,11 @@ class LightningModule(lightning.LightningModule):
                 device=class_logits.device,
             )
 
-            mask_ids = (scores[i][keep][..., None, None] * masks[keep]).argmax(0)
+            mask_ids = (class_scores[keep][..., None, None] * masks[keep]).argmax(0)
             stuff_segment_ids, segment_id = {}, 0
             segment_and_class_ids = []
 
-            for k, class_id in enumerate(classes[i][keep].tolist()):
+            for k, class_id in enumerate(class_ids[keep].tolist()):
                 orig_mask = masks[keep][k] >= 0.5
                 new_mask = mask_ids == k
                 final_mask = orig_mask & new_mask

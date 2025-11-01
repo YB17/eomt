@@ -21,6 +21,9 @@ class MaskClassificationLossCoarse(MaskClassificationLoss):
         masks_queries_logits: torch.Tensor,
         targets: List[dict],
         class_queries_logits: Optional[torch.Tensor] = None,
+        open_vocab_logits: Optional[torch.Tensor] = None,
+        text_priors: Optional[torch.Tensor] = None,
+        seen_mask: Optional[List[torch.Tensor]] = None,
     ):
         mask_labels = [
             target["masks"].to(masks_queries_logits.dtype) for target in targets
@@ -130,7 +133,9 @@ class MaskClassificationPanopticCoarse(LightningModule):
 
         img_sizes = [img.shape[-2:] for img in imgs]
         transformed_imgs = self.resize_and_pad_imgs_instance_panoptic(imgs)
-        mask_logits_per_layer, class_logits_per_layer = self(transformed_imgs)
+        outputs = self(transformed_imgs)
+        mask_logits_per_layer = outputs["mask_logits"]
+        class_logits_per_layer = outputs["class_logits"]
 
         is_crowds = [target["is_crowd"] for target in targets]
         targets = self.to_per_pixel_targets_panoptic_coarse(targets)
