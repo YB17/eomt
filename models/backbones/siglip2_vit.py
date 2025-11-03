@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.layers import DropPath
+
+from eomt.modules.lora import LoRAInjectionStats, inject_lora, summarize_lora
 
 try:
     from transformers import AutoConfig, AutoModel
@@ -87,6 +89,7 @@ class _SiglipAttentionWrapper(nn.Module):
         self.k_proj = attention.k_proj
         self.v_proj = attention.v_proj
         self.out_proj = attention.out_proj
+        self.proj = self.out_proj
         self.num_heads = attention.num_heads
         self.head_dim = attention.head_dim
         self.scale = attention.scale
@@ -100,6 +103,12 @@ class _SiglipAttentionWrapper(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:  # pragma: no cover - unused direct call
         attn_output, _ = self.attention(hidden_states)
         return attn_output
+
+    def qkv(self, x: torch.Tensor) -> torch.Tensor:
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        return torch.cat([q, k, v], dim=-1)
 
 
 class _SiglipBlockAdapter(nn.Module):
@@ -125,7 +134,13 @@ class _SiglipBlockAdapter(nn.Module):
 
 
 class SigLIP2ViTBackbone(nn.Module):
-    """SigLIP2 ViT backbone emitting patch tokens without pooling."""
+    """SigLIP2 ViT backbone emitting raw patch tokens.
+
+    The SigLIP2 vision tower ships with a MAP pooling head. This class bypasses
+    that head entirely and exposes the spatial patch tokens so they can be fed
+    into the EoMT segmentation head. Positional embeddings are interpolated on
+    the fly, enabling NaFlex-style variable input resolutions.
+    """
 
     def __init__(
         self,
@@ -135,6 +150,7 @@ class SigLIP2ViTBackbone(nn.Module):
         naflex: bool = True,
         img_size: Optional[int] = None,
         fp16: bool = True,
+        lora_cfg: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         self.config = Siglip2BackboneConfig(
@@ -146,15 +162,30 @@ class SigLIP2ViTBackbone(nn.Module):
             out_indices=tuple(out_indices),
         )
         self.vision = self._load_vision_model()
-        self.embed_dim = self.vision.config.hidden_size
-        self.num_prefix_tokens = 0
+
         self.out_indices = list(out_indices)
+        self.num_prefix_tokens = 0
+        self.embed_dim = self.vision.config.hidden_size
+        self.num_blocks = self.vision.config.num_hidden_layers
 
         self.patch_embed = _SiglipPatchEmbed(self.vision.embeddings)
         self.pos_embed = _SiglipPosEmbed(self.vision.embeddings, naflex=naflex)
         self.patch_drop = _Identity()
         self.norm_pre = _Identity()
         self.norm = self.vision.post_layernorm
+
+        self.lora_stats: Optional[LoRAInjectionStats] = None
+        if lora_cfg and lora_cfg.get("ENABLED", lora_cfg.get("enabled", False)):
+            self.lora_stats = inject_lora(
+                self.vision,
+                last_n_layers=int(lora_cfg.get("LAST_N_LAYERS", lora_cfg.get("layers_last_n", 12))),
+                r_attn=int(lora_cfg.get("RANK_ATTN", lora_cfg.get("rank_attn", lora_cfg.get("RANK", 16)))),
+                r_ffn=int(lora_cfg.get("RANK_FFN", lora_cfg.get("rank_ffn", lora_cfg.get("RANK", 32)))),
+                alpha_scale=float(lora_cfg.get("ALPHA_SCALE", lora_cfg.get("alpha_scale", 2.0))),
+                dropout=float(lora_cfg.get("DROPOUT", lora_cfg.get("dropout", 0.0))),
+                bias=str(lora_cfg.get("BIAS", lora_cfg.get("bias", "none"))),
+                include_proj=bool(lora_cfg.get("INCLUDE_PROJ", lora_cfg.get("include_proj", False))),
+            )
 
         drop_path_rates = torch.linspace(0, drop_path, self.vision.config.num_hidden_layers).tolist()
         self.blocks = nn.ModuleList(
@@ -339,3 +370,10 @@ class SigLIP2ViTBackbone(nn.Module):
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:  # pragma: no cover - compatibility helper
         return self.forward_features(x)
+
+    def get_lora_summary(self) -> Optional[LoRAInjectionStats]:
+        """Return cached LoRA statistics or recompute them on demand."""
+
+        if self.lora_stats is not None:
+            return self.lora_stats
+        return summarize_lora(self.vision)

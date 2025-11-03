@@ -188,3 +188,70 @@ def build_templates(multilingual: bool = False) -> Dict[str, List[str]]:
             "stuff": list(TEMPLATES_STUFF) + list(TEMPLATES_STUFF_ZH),
         }
     return {"things": list(TEMPLATES_THINGS), "stuff": list(TEMPLATES_STUFF)}
+
+
+OPEN_VOCAB_UNSEEN_THINGS_20: List[str] = [
+    "airplane",
+    "bus",
+    "train",
+    "boat",
+    "bench",
+    "bird",
+    "elephant",
+    "bear",
+    "zebra",
+    "giraffe",
+    "skateboard",
+    "surfboard",
+    "tennis racket",
+    "bottle",
+    "couch",
+    "microwave",
+    "oven",
+    "sink",
+    "toothbrush",
+    "motorcycle",
+]
+
+OPEN_VOCAB_UNSEEN_STUFF_17: List[str] = [
+    "banner",
+    "blanket",
+    "bridge",
+    "ceiling-other",
+    "ceiling-tile",
+    "cloth",
+    "clouds",
+    "counter",
+    "curtain",
+    "fence",
+    "floor-stone",
+    "ground-other",
+    "hill",
+    "light",
+    "mirror-stuff",
+    "pavement",
+    "platform",
+]
+
+OPEN_VOCAB_SPLITS: Dict[str, Dict[str, List[str]]] = {
+    "ovp_val": {
+        "seen_things": [c for c in COCO_THINGS_80 if c not in OPEN_VOCAB_UNSEEN_THINGS_20],
+        "unseen_things": list(OPEN_VOCAB_UNSEEN_THINGS_20),
+        "seen_stuff": [c for c in COCO_STUFF_53 if c not in OPEN_VOCAB_UNSEEN_STUFF_17],
+        "unseen_stuff": list(OPEN_VOCAB_UNSEEN_STUFF_17),
+    }
+}
+
+
+def get_open_vocab_split(name: str) -> Dict[str, List[str]]:
+    """Return a dictionary containing seen/unseen splits for the given split name."""
+
+    if name not in OPEN_VOCAB_SPLITS:
+        raise KeyError(f"Unknown open-vocabulary split: {name}")
+    split = OPEN_VOCAB_SPLITS[name]
+    return {
+        "seen_things": list(split["seen_things"]),
+        "unseen_things": list(split["unseen_things"]),
+        "seen_stuff": list(split["seen_stuff"]),
+        "unseen_stuff": list(split["unseen_stuff"]),
+    }

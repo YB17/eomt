@@ -7,13 +7,41 @@
 # ---------------------------------------------------------------
 
 from typing import Dict, List, Optional
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 from models.scale_block import ScaleBlock
 from .open_vocab_head import OpenVocabHead
+
+
+class QueryTokens(nn.Module):
+    """Container for learnable segmentation queries with optional text prior."""
+
+    def __init__(self, num_queries: int, dim: int, base: Optional[torch.Tensor], init_type: str) -> None:
+        super().__init__()
+        self.num_queries = num_queries
+        self.dim = dim
+        self.init_type = init_type
+        if base is not None and base.numel() > 0 and init_type.startswith("text"):
+            if base.shape[0] < num_queries:
+                repeats = math.ceil(num_queries / base.shape[0])
+                base = base.repeat(repeats, 1)[:num_queries]
+            else:
+                base = base[:num_queries]
+            self.register_buffer("base", base.clone(), persistent=False)
+            self.offset = nn.Parameter(torch.zeros(num_queries, dim))
+        else:
+            self.base = None  # type: ignore[assignment]
+            self.offset = nn.Parameter(torch.empty(num_queries, dim))
+            nn.init.normal_(self.offset, std=0.02)
+
+    def forward(self) -> torch.Tensor:
+        if getattr(self, "base", None) is not None:
+            return self.base + self.offset
+        return self.offset
 
 
 class EoMT(nn.Module):
@@ -26,6 +54,7 @@ class EoMT(nn.Module):
         masked_attn_enabled=True,
         open_vocab_head: Optional[OpenVocabHead] = None,
         fuse_closed_head: bool = False,
+        query_init: str = "learnable",
     ):
         super().__init__()
         self.encoder = encoder
@@ -34,10 +63,13 @@ class EoMT(nn.Module):
         self.masked_attn_enabled = masked_attn_enabled
         self.open_vocab_head = open_vocab_head
         self.fuse_closed_head = fuse_closed_head
+        self.query_init = query_init
 
         self.register_buffer("attn_mask_probs", torch.ones(num_blocks))
 
-        self.q = nn.Embedding(num_q, self.encoder.backbone.embed_dim)
+        self.query_text_proj: Optional[nn.Linear] = None
+        text_base = self._prepare_text_query_base(query_init)
+        self.query_tokens = QueryTokens(num_q, self.encoder.backbone.embed_dim, text_base, query_init)
 
         self.class_head = nn.Linear(self.encoder.backbone.embed_dim, num_classes + 1)
 
@@ -56,6 +88,25 @@ class EoMT(nn.Module):
         self.upscale = nn.Sequential(
             *[ScaleBlock(self.encoder.backbone.embed_dim) for _ in range(num_upscale)],
         )
+
+    def _prepare_text_query_base(self, init_type: str) -> Optional[torch.Tensor]:
+        if not init_type.startswith("text") or self.open_vocab_head is None:
+            return None
+        text_feats = self.open_vocab_head.text_features.detach()
+        if text_feats.numel() == 0:
+            return None
+        with torch.no_grad():
+            feats = text_feats.to(torch.float32)
+            if getattr(self.open_vocab_head, "text_projection", None) is not None:
+                proj = self.open_vocab_head.text_projection
+                feats = proj(feats.to(proj.weight.dtype)).to(torch.float32)
+        if feats.shape[-1] != self.encoder.backbone.embed_dim:
+            self.query_text_proj = nn.Linear(feats.shape[-1], self.encoder.backbone.embed_dim, bias=False)
+            nn.init.normal_(self.query_text_proj.weight, std=0.02)
+            feats = self.query_text_proj(feats)
+        else:
+            self.query_text_proj = None
+        return F.normalize(feats, dim=-1)
 
     def _predict(self, x: torch.Tensor):
         q = x[:, : self.num_q, :]
@@ -124,14 +175,16 @@ class EoMT(nn.Module):
         mask_logits_per_layer, class_logits_per_layer = [], []
         backbone_tokens_per_layer: List[torch.Tensor] = []
 
+        use_masked_attn = self.masked_attn_enabled and self.training
+
         for i, block in enumerate(self.encoder.backbone.blocks):
             if i == len(self.encoder.backbone.blocks) - self.num_blocks:
-                x = torch.cat(
-                    (self.q.weight[None, :, :].expand(x.shape[0], -1, -1), x), dim=1
-                )
+                queries = self.query_tokens().to(x.dtype)
+                queries = queries.unsqueeze(0).expand(x.shape[0], -1, -1)
+                x = torch.cat((queries, x), dim=1)
 
             if (
-                self.masked_attn_enabled
+                use_masked_attn
                 and i >= len(self.encoder.backbone.blocks) - self.num_blocks
             ):
                 norm_tokens = self.encoder.backbone.norm(x)
@@ -168,7 +221,7 @@ class EoMT(nn.Module):
                         i - len(self.encoder.backbone.blocks) + self.num_blocks
                     ],
                 )
-
+            
             x = x + block.drop_path1(
                 block.ls1(self._attn(block.attn, block.norm1(x), attn_mask))
             )
@@ -191,7 +244,8 @@ class EoMT(nn.Module):
                 self.num_q + self.encoder.backbone.num_prefix_tokens :,
                 :,
             ]
-            ov_logits, ov_sims = self.open_vocab_head(mask_logits, patch_tokens)
+            ov_out = self.open_vocab_head(mask_logits, patch_tokens)
+            ov_logits = ov_out["logits"]
             if (
                 self.fuse_closed_head
                 and class_logits is not None
@@ -200,7 +254,8 @@ class EoMT(nn.Module):
                 fused = 0.5 * (ov_logits + class_logits[..., :-1])
                 outputs["fused_logits"] = [fused]
             outputs["open_vocab_logits"] = [ov_logits]
-            outputs["open_vocab_sims"] = [ov_sims]
+            outputs["open_vocab_sims"] = [ov_out["similarity"]]
+            outputs["open_vocab_energy"] = [ov_out["energy"]]
             outputs["patch_tokens"] = [patch_tokens]
 
         return outputs

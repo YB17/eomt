@@ -130,18 +130,16 @@ A [notebook](inference.ipynb) is available for quick inference and visualization
 
 ## SigLIP2-EoMT-OVPanoptic
 
-The SigLIP2 variant keeps the encoder-only Mask Transformer philosophy while replacing the original ViT backbone with a SigLIP2 vision tower. The pipeline is still a single-stack transformer: image patches and learnable queries are tokenised together, self-attended end-to-end, and decoded into masks without any task-specific decoder. On top of the final query features we attach two heads:
+SigLIP2-EoMT keeps the encoder-only Mask Transformer philosophy while swapping the vanilla ViT for SigLIP2’s ViT tower (MAP pooling bypassed). Image patch tokens and segmentation queries share the very same encoder blocks; masked attention is trained with polynomial annealing (`P_mask: 1 → 0` with factor `0.9`) and disabled during inference. The final representation fans out into two light-weight heads:
 
-* a light-weight mask head that projects queries back to the patch grid (identical to vanilla EoMT), and
-* an open-vocabulary classifier that pools visual evidence inside each predicted mask and measures cosine similarity against SigLIP2 text embeddings.
+* a mask projector that upsamples query embeddings back to the patch grid, and
+* an open-vocabulary head that performs temperature-controlled mask pooling followed by similarity against SigLIP2 text embeddings (with optional multilingual prompts and per-class bias calibration).
 
 ### Three-stage recipe
 
-1. **Stage A – Frozen backbone warm-up.** Train only the query/mask heads. This stabilises optimisation when the SigLIP2 tower remains frozen. Recommended hyperparameters:
-   * `LR_HEAD = 5e-4`, `WD = 0.05`
-   * 30k–40k steps with random-res 640–1024 crops.
-2. **Stage B – LoRA fine-tuning.** Activate LoRA adapters on the last 8 transformer blocks (rank 8 for Q/K/V by default). Suggested LR for LoRA parameters: `1e-4`.
-3. **Optional Stage C – Wider adapters.** Increase LoRA rank (e.g. 16) and extend to FFN layers when domain shift requires extra capacity.
+1. **Stage A – Frozen backbone warm-up.** Freeze the SigLIP2 vision tower. Train mask/query heads plus the open-vocab classifier with mask annealing enabled. Queries can be initialised from SigLIP2 text embeddings (`QUERY_INIT=text+learnable`) to stabilise optimisation.
+2. **Stage B – LoRA fine-tuning.** Enable LoRA on the last 12 transformer blocks with rank 16 for Q/K/V and rank 32 for FFN (`fc1`, `fc2`). Only LoRA parameters remain trainable; the teacher tower provides light feature and ITC distillation.
+3. **Optional Stage C – Wider adapters.** Increase FFN rank (e.g. 48) and optionally fuse the last three block outputs before mask projection for extra headroom.
 
 ### Prompt templates & synonyms
 
@@ -152,7 +150,7 @@ a photo of a {}.
 a {} in the scene.
 ```
 
-Stuff categories use contextual prompts such as `a patch of {}` or `the {} background`. Synonyms help recover alternative phrasings, e.g. `"cell phone" → ["mobile phone", "smartphone"]`, `"couch" → ["sofa"]`. When `OPEN_VOCAB.MULTILINGUAL=true`, the head concatenates Mandarin templates like `"一张关于{}的照片。"` to the prompt set.
+Stuff categories use contextual prompts such as `a patch of {}` or `the {} background`. Synonyms help recover alternative phrasings, e.g. `"cell phone" → ["mobile phone", "smartphone"]`, `"couch" → ["sofa"]`. When `OPEN_VOCAB.MULTILINGUAL=true`, the head concatenates Mandarin templates like `"一张关于{}的照片。"` to the prompt set. Open-vocabulary splits (`OPEN_VOCAB_SPLIT=ovp_val`) keep 20 thing classes and 17 stuff classes unseen during training.
 
 ### Resource footprint
 
@@ -163,9 +161,9 @@ Stuff categories use contextual prompts such as `a patch of {}` or `the {} backg
 ### Frequently asked questions
 
 * **Why “NAFlex”?** SigLIP2 ships MAP pooling by default. We bypass that head and interpolate positional encodings so arbitrary resolutions (e.g. 640–1024) remain valid.
-* **Which layers receive LoRA?** By default only Q/K/V in the last eight blocks. Extending to FFN is exposed via `MODEL.BACKBONE.LORA.TARGET`.
-* **Stuff taxonomy looks noisy.** You can tailor templates or synonyms in `eomt/data/coco_ov_vocab.py`.
-* **Logit calibration.** Use `OPEN_VOCAB.TEMP` and `OPEN_VOCAB.CALIBRATION_BIAS` to tune similarity scores at validation time.
+* **Which layers receive LoRA?** The default config adapts Q/K/V and FFN (`fc1`/`fc2`) in the last 12 blocks with rank `(16, 32)`. `LAST_N_LAYERS`, `RANK_ATTN`, and `RANK_FFN` expose further control.
+* **Stuff taxonomy looks noisy.** Adjust templates, synonyms, or the seen/unseen split in `eomt/data/coco_ov_vocab.py`.
+* **Logit calibration.** Use `OPEN_VOCAB.TEMP`, `OPEN_VOCAB.CALIBRATION_BIAS`, and `OPEN_VOCAB.ENERGY_REJECT_THR` to calibrate similarity scores at validation time.
 
 ### Training & evaluation commands
 
@@ -180,9 +178,19 @@ python tools/train_net.py \
 python tools/train_net.py \
   --config-file configs/coco_panoptic_siglip2_eomt_ov.yaml \
   MODEL.BACKBONE.LORA.ENABLED true \
-  MODEL.BACKBONE.LORA.RANK 8 \
-  MODEL.BACKBONE.LORA.LAYERS_LAST_N 8 \
+  MODEL.BACKBONE.LORA.LAST_N_LAYERS 12 \
+  MODEL.BACKBONE.LORA.RANK_ATTN 16 \
+  MODEL.BACKBONE.LORA.RANK_FFN 32 \
   OUTPUT_DIR runs/coco_eomt_siglip2_ov/stageB
+
+# Stage C – LoRA FFN rank sweep + multi-layer aggregation
+python tools/train_net.py \
+  --config-file configs/coco_panoptic_siglip2_eomt_ov.yaml \
+  MODEL.BACKBONE.LORA.ENABLED true \
+  MODEL.BACKBONE.LORA.LAST_N_LAYERS 16 \
+  MODEL.BACKBONE.LORA.RANK_ATTN 16 \
+  MODEL.BACKBONE.LORA.RANK_FFN 48 \
+  OUTPUT_DIR runs/coco_eomt_siglip2_ov/stageC
 
 # Validation
 python tools/test_net.py \
@@ -192,6 +200,8 @@ python tools/test_net.py \
 # Smoke test for the SigLIP2 + Open-Vocab stack
 pytest -q tests/test_siglip2_ov.py
 ```
+
+**Results placeholder.** Full COCO panoptic metrics (`PQ_all`, `PQ_th`, `PQ_st`, `PQ_unseen`) are logged during training; populate the table below after running Stage B/Stage C on your hardware.
 
 ## Model Zoo
 
