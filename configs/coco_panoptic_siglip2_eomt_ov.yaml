@@ -4,33 +4,51 @@ MODEL:
     MODEL_ID: "<SIGLIP2_MODEL_ID>"
     DROP_PATH: 0.1
     NAFLEX: true
+    FREEZE: false
     LORA:
       ENABLED: true
-      RANK: 8
-      ALPHA: 16
-      TARGET: ["q_proj", "k_proj", "v_proj"]
-      LAYERS_LAST_N: 8
+      LAST_N_LAYERS: 12
+      RANK_ATTN: 16
+      RANK_FFN: 32
+      ALPHA_SCALE: 2.0
+      DROPOUT: 0.05
+      BIAS: "none"
   HEAD:
     TYPE: EoMT
     NUM_QUERIES: 150
+    NUM_BLOCKS: 4
     MASK_PROJ_DIM: ${MODEL.BACKBONE.EMBED_DIM}
+    QUERY_INIT: "text+learnable"
   OPEN_VOCAB:
     ENABLED: true
     TEXT_MODEL_ID: "<SIGLIP2_TEXT_ID>"
     MULTILINGUAL: false
-    FUSE_CLOSED_HEAD: false
+    POOL_TEMPERATURE: 1.0
     TEMP: 0.02
     CALIBRATION_BIAS: 0.0
+    ENERGY_REJECT_THR: -inf
+    SYNONYMS_JSON: null
 LOSS:
   MATCH:
     LAMBDA_MASK_IOU: 2.0
     LAMBDA_BCE: 2.0
     LAMBDA_CLS: 1.0
   OV:
-    KL_WEIGHT: 0.5
+    KL_TEXT_WEIGHT: 0.5
   DISTILL:
     FEAT_ALIGN: 0.001
     ITC_WEIGHT: 0.05
+  SEG:
+    FOCAL_GAMMA: 2.0
+    FOCAL_ALPHA: 0.25
+    DICE_EPS: 1.0e-5
+ANNEAL:
+  ENABLED: true
+  L2_BLOCKS: 4
+  SCHEDULE: "poly"
+  FACTOR: 0.9
+  START_P: 1.0
+  END_P: 0.0
 DATA:
   DATASET: coco_panoptic
   ROOT: "<DATA_ROOT>"
@@ -38,13 +56,23 @@ DATA:
   VAL_SPLIT: val2017
   TRAIN_RES_MIN: 640
   TRAIN_RES_MAX: 1024
+  BATCH_SIZE: 4
+  NUM_WORKERS: 8
+  OPEN_VOCAB_SPLIT: "ovp_val"
 SOLVER:
   OPTIM: AdamW
-  LR_HEAD: 5e-4
-  LR_LORA: 1e-4
   WD: 0.05
-  STEPS: 120000
+  LR_HEAD: 5.0e-4
+  LR_LORA: 1.0e-4
+  LLRD: 0.8
+  CLIP_GRAD: 1.0
+  EPOCHS: 12
+  LR_SCHEDULE: "poly"
+  LR_DECAY_FACTOR: 0.9
+  WARMUP_STEPS: [500, 1000]
 TEST:
   EVAL_PQ: true
-  OV_SPLIT: "ovp_val"
+  MIN_MASK_SCORE: 0.5
+  MIN_AREA: 256
+  OV_LOGIT_BIAS: 0.0
 OUTPUT_DIR: "<OUTPUT_DIR>"
