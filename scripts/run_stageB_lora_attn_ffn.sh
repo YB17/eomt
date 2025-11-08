@@ -7,4 +7,5 @@ python tools/train_net.py \
   MODEL.BACKBONE.LORA.LAST_N_LAYERS 12 \
   MODEL.BACKBONE.LORA.RANK_ATTN 16 \
   MODEL.BACKBONE.LORA.RANK_FFN 32 \
+  MODEL.BACKBONE.FREEZE true \
   OUTPUT_DIR "${1:-runs/coco_eomt_siglip2_ov/stageB}"

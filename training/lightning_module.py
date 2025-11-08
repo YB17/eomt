@@ -55,6 +55,7 @@ class LightningModule(lightning.LightningModule):
         weight_decay: float,
         poly_power: float,
         warmup_steps: tuple[int, int],
+        lr_lora: Optional[float] = None,
         ckpt_path=None,
         load_ckpt_class_head=True,
         distill_feat_weight: float = 0.0,
@@ -71,6 +72,7 @@ class LightningModule(lightning.LightningModule):
         self.attn_mask_annealing_start_steps = attn_mask_annealing_start_steps
         self.attn_mask_annealing_end_steps = attn_mask_annealing_end_steps
         self.lr = lr
+        self.lr_lora = lr_lora if lr_lora is not None else lr
         self.llrd = llrd
         self.weight_decay = weight_decay
         self.poly_power = poly_power
@@ -132,32 +134,27 @@ class LightningModule(lightning.LightningModule):
     这样的优化器配置能显著提升模型在分割任务上的收敛速度与最终性能，同时兼顾对预训练骨干的保护与新任务头的快速学习。
     '''
     def configure_optimizers(self):
-        encoder_param_names = {
-            n for n, _ in self.network.encoder.backbone.named_parameters()
-        }
         backbone_param_groups = []
         other_param_groups = []
-        backbone_blocks = len(self.network.encoder.backbone.blocks)
-        block_i = backbone_blocks
+        backbone_blocks = len(getattr(self.network.encoder.backbone, "blocks", []))
+        if backbone_blocks == 0:
+            backbone_blocks = 1
 
-        for name, param in reversed(list(self.named_parameters())):
-            lr = self.lr
-            if name.replace("network.encoder.backbone.", "") in encoder_param_names:
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name.startswith("network.encoder.backbone"):
+                base_lr = self.lr_lora if getattr(param, "_is_lora_param", False) else self.lr
+                lr = base_lr
                 name_list = name.split(".")
-                is_block = False
-                for i, key in enumerate(name_list):
-                    if key == "blocks":
-                        block_i = int(name_list[i + 1])
-                        is_block = True
-                if is_block or block_i == 0:
-                    lr *= self.llrd ** (backbone_blocks - 1 - block_i)
-                backbone_param_groups.append(
-                    {"params": [param], "lr": lr, "name": name}
-                )
+                if "blocks" in name_list:
+                    idx = name_list.index("blocks")
+                    if idx + 1 < len(name_list):
+                        block_i = int(name_list[idx + 1])
+                        lr = base_lr * self.llrd ** (backbone_blocks - 1 - block_i)
+                backbone_param_groups.append({"params": [param], "lr": lr, "name": name})
             else:
-                other_param_groups.append(
-                    {"params": [param], "lr": self.lr, "name": name}
-                )
+                other_param_groups.append({"params": [param], "lr": self.lr, "name": name})
 
         param_groups = backbone_param_groups + other_param_groups
         optimizer = AdamW(param_groups, weight_decay=self.weight_decay)
