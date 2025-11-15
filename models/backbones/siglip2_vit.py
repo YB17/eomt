@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import torch
@@ -19,6 +21,11 @@ except Exception:  # pragma: no cover - optional dependency
     AutoModel = None  # type: ignore
     SiglipVisionModel = None  # type: ignore
     SiglipVisionConfig = None  # type: ignore
+
+try:  # pragma: no cover - optional dependency
+    import open_clip
+except Exception:  # pragma: no cover - optional dependency
+    open_clip = None  # type: ignore
 
 
 @dataclass
@@ -80,6 +87,150 @@ class _Identity(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # pragma: no cover - trivial
         return x
 
+
+class _OpenClipEmbeddings(nn.Module):
+    def __init__(self, trunk: nn.Module) -> None:
+        super().__init__()
+        self.patch_embedding = trunk.patch_embed
+        img_size = getattr(self.patch_embedding, "img_size", getattr(trunk, "img_size", 224))
+        if isinstance(img_size, int):
+            img_size = (img_size, img_size)
+        self.image_size = img_size
+        patch_size = getattr(self.patch_embedding, "patch_size", 16)
+        if isinstance(patch_size, int):
+            patch_size = (patch_size, patch_size)
+        self.patch_size = patch_size
+        self.grid_size = getattr(self.patch_embedding, "grid_size", (img_size[0] // patch_size[0], img_size[1] // patch_size[1]))
+        self.num_patches = getattr(self.patch_embedding, "num_patches", self.grid_size[0] * self.grid_size[1])
+
+        pos_embed = getattr(trunk, "pos_embed", None)
+        if pos_embed is None:
+            pos_embed = torch.zeros(1, self.num_patches, getattr(trunk, "embed_dim", 0))
+        if pos_embed.shape[1] == self.num_patches + 1:
+            pos_embed = pos_embed[:, 1:, :]
+        self.position_embedding = nn.Parameter(pos_embed.detach().clone())
+        self.register_buffer("position_ids", torch.arange(self.num_patches), persistent=False)
+        self.last_hw: Optional[tuple[int, int]] = None
+
+    def interpolate_pos_encoding(self, x: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        pos = self.position_embedding.to(dtype=x.dtype, device=x.device)
+        patch_h = height // self.patch_size[0]
+        patch_w = width // self.patch_size[1]
+        if patch_h * patch_w == pos.shape[1]:
+            return pos
+        grid_h, grid_w = self.grid_size
+        grid = pos.reshape(1, grid_h, grid_w, pos.shape[-1]).permute(0, 3, 1, 2)
+        grid = F.interpolate(grid, size=(patch_h, patch_w), mode="bicubic", align_corners=False)
+        return grid.permute(0, 2, 3, 1).reshape(1, -1, pos.shape[-1])
+
+
+class _OpenClipAttentionAdapter(nn.Module):
+    def __init__(self, attn: nn.Module) -> None:
+        super().__init__()
+        if not hasattr(attn, "qkv") or not hasattr(attn, "proj"):
+            raise ValueError("OpenCLIP attention module is missing qkv/proj weights")
+
+        embed_dim = attn.qkv.weight.shape[1]
+        self.num_heads = getattr(attn, "num_heads", 1)
+        self.head_dim = getattr(attn, "head_dim", embed_dim // self.num_heads)
+        self.scale = getattr(attn, "scale", self.head_dim**-0.5)
+        bias = attn.qkv.bias is not None
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=attn.proj.bias is not None)
+        self.proj = self.out_proj
+
+        q_weight, k_weight, v_weight = attn.qkv.weight.chunk(3, dim=0)
+        with torch.no_grad():
+            self.q_proj.weight.copy_(q_weight)
+            self.k_proj.weight.copy_(k_weight)
+            self.v_proj.weight.copy_(v_weight)
+            if bias:
+                q_bias, k_bias, v_bias = attn.qkv.bias.chunk(3)
+                self.q_proj.bias.copy_(q_bias)
+                self.k_proj.bias.copy_(k_bias)
+                self.v_proj.bias.copy_(v_bias)
+            self.out_proj.weight.copy_(attn.proj.weight)
+            if attn.proj.bias is not None:
+                self.out_proj.bias.copy_(attn.proj.bias)
+
+        dropout = getattr(attn, "attn_drop", nn.Dropout(0.0))
+        proj_dropout = getattr(attn, "proj_drop", nn.Dropout(0.0))
+        self.attn_drop = nn.Dropout(getattr(dropout, "p", 0.0))
+        self.proj_drop = nn.Dropout(getattr(proj_dropout, "p", 0.0))
+        self.q_norm = getattr(attn, "q_norm", _Identity())
+        self.k_norm = getattr(attn, "k_norm", _Identity())
+        self.fused_attn = False
+        self.dropout = getattr(attn, "dropout", getattr(dropout, "p", 0.0))
+
+        # Original module no longer needed for forward pass
+        self._original_attn = attn
+
+        self.to(dtype=attn.qkv.weight.dtype)
+
+    def forward(self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, None]:
+        B, N, _ = hidden_states.shape
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+
+        q = q.view(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = k.view(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v.view(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        if attention_mask is not None:
+            attn_scores = attn_scores + attention_mask
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        attn_probs = self.attn_drop(attn_probs)
+
+        out = torch.matmul(attn_probs, v)
+        out = out.transpose(1, 2).reshape(B, N, self.num_heads * self.head_dim)
+        out = self.out_proj(out)
+        out = self.proj_drop(out)
+        return out, None
+
+
+class _OpenClipBlock(nn.Module):
+    def __init__(self, block: nn.Module) -> None:
+        super().__init__()
+        self.layer_norm1 = block.norm1
+        self.self_attn = _OpenClipAttentionAdapter(block.attn)
+        self.layer_norm2 = block.norm2
+        self.mlp = block.mlp
+
+
+class _OpenClipEncoder(nn.Module):
+    def __init__(self, blocks: List[_OpenClipBlock]) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(blocks)
+
+
+class _OpenClipVisionAdapter(nn.Module):
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        trunk = model
+        if hasattr(trunk, "visual"):
+            trunk = getattr(trunk, "visual")
+        if hasattr(trunk, "trunk"):
+            trunk = getattr(trunk, "trunk")
+
+        self.embeddings = _OpenClipEmbeddings(trunk)
+        blocks = [_OpenClipBlock(block) for block in getattr(trunk, "blocks", [])]
+        self.encoder = _OpenClipEncoder(blocks)
+        self.post_layernorm = getattr(trunk, "norm", nn.LayerNorm(blocks[0].mlp.fc2.out_features if blocks else 768))
+
+        hidden_size = getattr(trunk, "embed_dim", self.post_layernorm.normalized_shape[0])
+        num_layers = len(blocks)
+        self.config = type("Cfg", (), {"hidden_size": hidden_size, "num_hidden_layers": num_layers})()
+
+        self.use_head = False
+        self.head = _Identity()
 
 class _SiglipAttentionWrapper(nn.Module):
     def __init__(self, attention: nn.Module):
@@ -206,6 +357,9 @@ class SigLIP2ViTBackbone(nn.Module):
             return self._build_dummy_vision_model()
 
         if self.config.model_id:
+            oc_path = self._detect_open_clip_path(Path(self.config.model_id))
+            if oc_path is not None:
+                return self._load_open_clip_vision_model(oc_path)
             if AutoModel is None:
                 raise ImportError("transformers AutoModel is unavailable")
             try:
@@ -228,6 +382,68 @@ class SigLIP2ViTBackbone(nn.Module):
         if hasattr(vision_model, "use_head"):
             vision_model.use_head = False
             vision_model.head = _Identity()
+        return vision_model
+
+    @staticmethod
+    def _detect_open_clip_path(path: Path) -> Optional[Path]:
+        if path.is_file():
+            if "open_clip" in path.name:
+                return path.parent
+            return None
+        if not path.exists():
+            return None
+        for candidate in (
+            path / "open_clip_model.safetensors",
+            path / "open_clip_pytorch_model.bin",
+            path / "model.open_clip.pt",
+        ):
+            if candidate.exists():
+                return path
+        return None
+
+    def _load_open_clip_vision_model(self, path: Path) -> nn.Module:
+        if open_clip is None:
+            raise ImportError("open_clip_torch is required to load OpenCLIP checkpoints")
+
+        model_root = path
+        precision = "fp16" if self.config.fp16 else "fp32"
+        try:
+            clip_model = open_clip.create_model_from_pretrained(
+                f"local-dir:{model_root}",
+                device="cpu",
+                precision=precision,
+                return_transform=False,
+                cache_dir=None,
+            )
+        except Exception:
+            # Fallback: attempt to read architecture metadata
+            config_path = model_root / "open_clip_config.json"
+            model_name: Optional[str] = None
+            if config_path.exists():
+                try:
+                    with config_path.open("r", encoding="utf-8") as handle:
+                        cfg = json.load(handle)
+                    model_name = cfg.get("model_name") or cfg.get("model")
+                    if model_name is None and isinstance(cfg.get("architectures"), list):
+                        model_name = cfg["architectures"][0]
+                except Exception:
+                    model_name = None
+            if model_name is None:
+                model_name = "local-dir:" + str(model_root)
+            clip_model = open_clip.create_model_from_pretrained(
+                model_name,
+                pretrained=str(model_root / "open_clip_model.safetensors")
+                if (model_root / "open_clip_model.safetensors").exists()
+                else None,
+                device="cpu",
+                precision=precision,
+                return_transform=False,
+                cache_dir=None,
+            )
+
+        dtype = torch.float16 if self.config.fp16 else torch.float32
+        clip_model = clip_model.to(dtype=dtype)
+        vision_model = _OpenClipVisionAdapter(clip_model).to(dtype=dtype)
         return vision_model
 
     def _build_dummy_vision_model(self) -> nn.Module:
