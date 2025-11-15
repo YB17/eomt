@@ -1,7 +1,7 @@
 MODEL:
   BACKBONE:
-    NAME: siglip2_vit_b_16_naflex
-    MODEL_ID: "<SIGLIP2_MODEL_ID>"
+    NAME: ViT-B-16-SigLIP2-512
+    MODEL_ID: "/home/host/siglip2/"
     DROP_PATH: 0.1
     NAFLEX: true
     FREEZE: false
@@ -21,7 +21,7 @@ MODEL:
     QUERY_INIT: "text+learnable"
   OPEN_VOCAB:
     ENABLED: true
-    TEXT_MODEL_ID: "<SIGLIP2_TEXT_ID>"
+    TEXT_MODEL_ID: "/home/host/siglip2/"
     MULTILINGUAL: false
     TEMP: 0.02
     CALIBRATION_BIAS: 0.0
@@ -50,7 +50,7 @@ ANNEAL:
   END_P: 0.0
 DATA:
   DATASET: coco_panoptic
-  ROOT: "<DATA_ROOT>"
+  ROOT: "/home/host/coco"
   TRAIN_SPLIT: train2017
   VAL_SPLIT: val2017
   TRAIN_RES_MIN: 640
