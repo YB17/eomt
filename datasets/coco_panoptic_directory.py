@@ -177,10 +177,14 @@ class COCOPanopticDirectory(LightningDataModule):
         batch_size: int = 16,
         img_size: tuple[int, int] = (640, 640),
         num_classes: int = 133,
-        color_jitter_enabled=False,
+        color_jitter_enabled: bool = False,
         scale_range=(0.1, 2.0),
         check_empty_targets=True,
-        # check_empty_targets=False,
+        pin_memory: bool = True,
+        persistent_workers: bool = True,
+        train_transform_cfg: dict | None = None,
+        val_transform_cfg: dict | None = None,
+        resolution_preset: str = "Safe",
     ) -> None:
         super().__init__(
             path=path,
@@ -189,16 +193,27 @@ class COCOPanopticDirectory(LightningDataModule):
             num_classes=num_classes,
             img_size=img_size,
             check_empty_targets=check_empty_targets,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
         )
         self.save_hyperparameters(ignore=["_class_path"])
         self.stuff_classes = stuff_classes
 
-        # self.transforms = Transforms(
-        #     img_size=img_size,
-        #     color_jitter_enabled=color_jitter_enabled,
-        #     scale_range=scale_range,
-        # )
-        self.transforms = MinimalTransforms(img_size=img_size)
+        self.resolution_preset = resolution_preset
+        self.train_transform_cfg = train_transform_cfg or {}
+        self.val_transform_cfg = val_transform_cfg or {}
+
+        self.train_transforms = Transforms(
+            img_size=img_size,
+            color_jitter_enabled=self.train_transform_cfg.get("color_jitter", color_jitter_enabled),
+            scale_range=(1.0, 1.0),
+            short_edge_range=tuple(self.train_transform_cfg.get("short_edge", [])) if self.train_transform_cfg.get("short_edge") else None,
+            max_long_edge=self.train_transform_cfg.get("long_edge_max"),
+            crop_sizes=self.train_transform_cfg.get("crop_sizes"),
+            keep_full_instances=self.train_transform_cfg.get("keep_full_instances", True),
+            flip_prob=float(self.train_transform_cfg.get("flip_prob", 0.5)),
+        )
+        self.eval_transforms = MinimalTransforms(img_size=img_size)
         self.tiny_train_size = 32
         self.tiny_val_size = 32
 
@@ -249,7 +264,7 @@ class COCOPanopticDirectory(LightningDataModule):
                 data_path=Path(self.path),
                 img_suffix=".jpg",
                 target_parser=self.target_parser,
-                transforms=self.transforms,
+                transforms=self.train_transforms,
                 only_annotations_json=False,
                 target_suffix=".png",
                 stuff_classes=self.stuff_classes,
@@ -264,7 +279,7 @@ class COCOPanopticDirectory(LightningDataModule):
                 data_path=Path(self.path),
                 img_suffix=".jpg",
                 target_parser=self.target_parser,
-                transforms=self.transforms,
+                transforms=self.eval_transforms,
                 only_annotations_json=False,
                 target_suffix=".png",
                 stuff_classes=self.stuff_classes,

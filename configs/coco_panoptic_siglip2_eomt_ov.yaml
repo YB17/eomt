@@ -1,105 +1,116 @@
-MODEL:
-  BACKBONE:
-    NAME: ViT-B-16-SigLIP2-512
-    MODEL_ID: "/home/host/siglip2/"
-    DROP_PATH: 0.1
-    NAFLEX: false
-    FREEZE: false
-    FP16: false
-    LORA:
-      ENABLED: true
-      LAST_N_LAYERS: 12
-      RANK_ATTN: 16
-      RANK_FFN: 32
-      ALPHA_SCALE: 2.0
-      DROPOUT: 0.05
-      BIAS: "none"
-  HEAD:
-    TYPE: EoMT
-    NUM_QUERIES: 150
-    NUM_BLOCKS: 4
-    MASK_PROJ_DIM: ${MODEL.BACKBONE.EMBED_DIM}
-    QUERY_INIT: "text+learnable"
-  OPEN_VOCAB:
-    ENABLED: true
-    TEXT_MODEL_ID: "/home/host/siglip2/"
-    MULTILINGUAL: false
-    TEMP: 0.02
-    CALIBRATION_BIAS: 0.0
-    ENERGY_REJECT_THR: -inf
-    SYNONYMS_JSON: null
-LOSS:
-  MATCH:
-    LAMBDA_MASK_IOU: 2.0
-    LAMBDA_BCE: 2.0
-    LAMBDA_CLS: 1.0
-  OV:
-    KL_TEXT_WEIGHT: 0.5
-  DISTILL:
-    FEAT_ALIGN: 0.001
-    ITC_WEIGHT: 0.05
-  SEG:
-    FOCAL_GAMMA: 2.0
-    FOCAL_ALPHA: 0.25
-    DICE_EPS: 1.0e-5
-ANNEAL:
-  ENABLED: true
-  L2_BLOCKS: 4
-  SCHEDULE: "poly"
-  FACTOR: 0.9
-  START_P: 1.0
-  END_P: 0.0
+STAGE: "A"
+EPOCHS: 5
+GLOBAL_BATCH_SIZE: 32
+BACKBONE_FREEZE: true
+USE_LORA: false
+SEED: 3407
+RESOLUTION:
+  PRESET: "Safe"
+  SAFE:
+    SHORT_EDGE: [448, 576]
+    LONG_EDGE_MAX: 576
+    CROP_SIZES: [512, 576]
+    COLOR_JITTER: true
+    FLIP_PROB: 0.5
+  PERFPLUS:
+    SHORT_EDGE: [560, 704]
+    LONG_EDGE_MAX: 704
+    CROP_SIZES: [640, 672]
+    COLOR_JITTER: true
+    FLIP_PROB: 0.5
+    AMP: true
+    SDPA: true
+    FLASH_ATTN: true
+    GRADIENT_CHECKPOINT: true
+    GRAD_ACCUM: 2
 DATA:
   DATASET: coco_panoptic
   ROOT: "/home/host/coco"
   TRAIN_SPLIT: train2017
   VAL_SPLIT: val2017
-  TRAIN_RES_MIN: 512
-  TRAIN_RES_MAX: 512
+  TRAIN_RES_MAX: 576
   BATCH_SIZE: 4
   NUM_WORKERS: 8
+  PIN_MEMORY: true
+  PERSISTENT_WORKERS: true
+  CHECK_EMPTY_TARGETS: true
   OPEN_VOCAB_SPLIT: "ovp_val"
 SOLVER:
   OPTIM: AdamW
-  WD: 0.05
-  LR_HEAD: 2.0e-4
-  LR_LORA: 4.0e-4
-  LLRD: 0.8
+  LR_HEAD: 5.0e-4
+  LR_OTHER: 3.0e-4
+  WD_HEAD: 0.0
+  WD_OTHER: 0.05
+  BETAS: [0.9, 0.98]
   CLIP_GRAD: 1.0
-  EPOCHS: 12
-  LR_SCHEDULE: "poly"
-  LR_DECAY_FACTOR: 0.9
-  WARMUP_STEPS: [500, 1000]
-TEST:
-  EVAL_PQ: true
+  EPOCHS: 5
+  WARMUP_RATIO: 0.05
+  LR_SCHEDULE: "cosine"
+LOSS:
+  MATCH:
+    LAMBDA_MASK_IOU: 2.0
+    LAMBDA_BCE: 1.0
+    LAMBDA_CLS: 0.5
+  SEG:
+    LAMBDA_BCE: 2.0
+    LAMBDA_DICE: 1.0
+  OV:
+    KL_TEXT_WEIGHT: 0.3
+    KL_TEMPERATURE: 2.0
+    CE_WEIGHT: 1.0
+  AUX:
+    WEIGHT: 0.3
+  DISTILL:
+    FEAT_ALIGN: 0.0
+    ITC_WEIGHT: 0.0
+MODEL:
+  BACKBONE:
+    NAME: ViT-B-16-SigLIP2-512
+    MODEL_ID: "/home/host/siglip2/"
+    DROP_PATH: 0.1
+    NAFLEX: true
+    FREEZE: true
+    FP16: true
+    LORA:
+      ENABLED: false
+  HEAD:
+    TYPE: EoMT
+    NUM_QUERIES: 150
+    NUM_BLOCKS: 4
+    MASK_PROJ_DIM: 768
+    QUERY_INIT: "text+learnable"
+    MASKED_ATTN: true
+  OPEN_VOCAB:
+    ENABLED: true
+    TEXT_MODEL_ID: "/home/host/siglip2/"
+    MULTILINGUAL: false
+    TEMP: 0.07
+    CALIBRATION_BIAS: 0.0
+    ENERGY_REJECT_THR: -inf
+    PER_CLASS_BIAS: "auto"
+    SYNONYMS_JSON: null
+EVAL:
+  INTERVAL_EPOCHS: 1
   MIN_MASK_SCORE: 0.5
   MIN_AREA: 256
-  OV_LOGIT_BIAS: 0.0
-OUTPUT_DIR: "<OUTPUT_DIR>"
-
+  PQ_METRICS: ["PQ_all", "PQ_things", "PQ_stuff"]
 TRAINER:
-  PRECISION: "16-mixed"  # 推荐混合精度以提高速度
-  DEVICES: 8             # 使用的 GPU 数量
-  STRATEGY: "ddp_find_unused_parameters_true"        # 分布式策略
-  NUM_NODES: 1           # 节点数（单机多卡为1）
-  ACCELERATOR: "gpu"     # 加速器类型
+  PRECISION: "16-mixed"
+  DEVICES: 8
+  NUM_NODES: 1
+  ACCELERATOR: "gpu"
+  STRATEGY: "ddp_find_unused_parameters_true"
   SYNC_BATCHNORM: true
+  LIMIT_VAL_BATCHES: null
+  VAL_CHECK_INTERVAL: 1.0
 LOGGING:
   WANDB:
     ENABLED: false
-    PROJECT: null
+    PROJECT: "eomt"
     ENTITY: null
     GROUP: null
-    NAME: null
-    TAGS: []
+    NAME: "stageA_siglip2"
+    TAGS: ["stageA", "SigLIP2"]
     MODE: online
     RESUME: never
-    LOG_MODEL: false
-    LOG_CONFIG: true
-    NOTES: null
-    JOB_TYPE: null
-    ID: null
-    WATCH:
-      ENABLED: true
-      LOG: gradients
-      LOG_FREQ: 250
+OUTPUT_DIR: "outputs/coco_eomt_siglip2_stageA"

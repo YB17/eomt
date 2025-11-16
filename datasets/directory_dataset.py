@@ -145,8 +145,6 @@ class DirectoryDataset(torch.utils.data.Dataset):
         # 获取所有图像文件
         img_pattern = f"**/*{img_stem_suffix}{img_suffix}"
         img_files = list(self.img_folder_full_path.glob(img_pattern))
-        print(f"img_files: {len(img_files)}")
-        print(f"img_files: {img_files[0]}")
         
         for img_file in sorted(img_files, key=self._sort_key_path):
             if not img_file.is_file():
@@ -179,15 +177,13 @@ class DirectoryDataset(torch.utils.data.Dataset):
                         continue
             else:
                 if not only_annotations_json:
-                    if not target_file_path.exists():
-                        print(f"img_file.name: {img_file.name} target_file_path: {target_file_path} not exists")
-                        continue
+                if not target_file_path.exists():
+                    continue
 
-                    if check_empty_targets:
-                        min_val, max_val = Image.open(target_file_path).getextrema()
-                        if min_val == max_val:
-                            print(f"img_file.name: {img_file.name} target_file_path: {target_file_path} is empty")
-                            continue
+                if check_empty_targets:
+                    min_val, max_val = Image.open(target_file_path).getextrema()
+                    if min_val == max_val:
+                        continue
 
             # 检查实例目标文件
             if self.target_instance_folder_full_path is not None:

@@ -24,6 +24,11 @@ class Transforms(nn.Module):
         max_contrast_factor: float = 0.5,
         saturation_factor: float = 0.5,
         max_hue_delta: int = 18,
+        short_edge_range: tuple[int, int] | None = None,
+        max_long_edge: int | None = None,
+        crop_sizes: list[int] | tuple[int, ...] | None = None,
+        keep_full_instances: bool = False,
+        flip_prob: float = 0.5,
     ):
         super().__init__()
 
@@ -34,8 +39,19 @@ class Transforms(nn.Module):
         self.max_saturation_factor = saturation_factor
         self.max_hue_delta = max_hue_delta / 360.0
 
-        self.random_horizontal_flip = T.RandomHorizontalFlip()
-        self.scale_jitter = T.ScaleJitter(target_size=img_size, scale_range=scale_range)
+        self.short_edge_range = short_edge_range
+        self.max_long_edge = max_long_edge if max_long_edge is not None else max(img_size)
+        crop_sizes = list(crop_sizes or [])
+        self.crop_sizes = crop_sizes if crop_sizes else [img_size[0]]
+        self.keep_full_instances = keep_full_instances
+        self.max_crop_attempts = 8
+
+        self.random_horizontal_flip = T.RandomHorizontalFlip(p=flip_prob)
+        self.scale_jitter = (
+            T.ScaleJitter(target_size=img_size, scale_range=scale_range)
+            if scale_range is not None
+            else None
+        )
         self.random_crop = T.RandomCrop(img_size)
 
     def _random_factor(self, factor: float, center: float = 1.0):
@@ -107,6 +123,59 @@ class Transforms(nn.Module):
         
         return filtered_target
 
+    def _resize_short_edge(
+        self, img: Tensor, target: dict[str, Union[Tensor, TVTensor]]
+    ) -> tuple[Tensor, dict[str, Union[Tensor, TVTensor]]]:
+        if not self.short_edge_range:
+            if self.scale_jitter is not None:
+                return self.scale_jitter(img, target)
+            return img, target
+
+        short = torch.randint(
+            int(self.short_edge_range[0]),
+            int(self.short_edge_range[1]) + 1,
+            (1,),
+        ).item()
+        h, w = img.shape[-2:]
+        min_hw = min(h, w)
+        scale = short / max(min_hw, 1)
+        new_h = min(int(round(h * scale)), self.max_long_edge)
+        new_w = min(int(round(w * scale)), self.max_long_edge)
+        img = F.resize(img, [new_h, new_w], interpolation=F.InterpolationMode.BILINEAR)
+        target["masks"] = F.resize(
+            target["masks"],
+            [new_h, new_w],
+            interpolation=F.InterpolationMode.NEAREST,
+        )
+        return img, target
+
+    def _safe_random_square_crop(
+        self, img: Tensor, target: dict[str, Union[Tensor, TVTensor]]
+    ) -> tuple[Tensor, dict[str, Union[Tensor, TVTensor]]]:
+        if not self.crop_sizes:
+            return img, target
+
+        h, w = img.shape[-2:]
+        crop_candidates = [size for size in self.crop_sizes if size <= min(h, w)]
+        if not crop_candidates:
+            return img, target
+
+        for _ in range(self.max_crop_attempts):
+            size = int(crop_candidates[torch.randint(0, len(crop_candidates), (1,)).item()])
+            top = torch.randint(0, h - size + 1, (1,)).item()
+            left = torch.randint(0, w - size + 1, (1,)).item()
+            cropped_img = F.crop(img, top, left, size, size)
+            cropped_masks = F.crop(target["masks"], top, left, size, size)
+            if self.keep_full_instances:
+                valid = cropped_masks.flatten(1).any(-1)
+                if not bool(valid.all()):
+                    continue
+            img = cropped_img
+            target["masks"] = cropped_masks
+            return img, target
+
+        return img, target
+
     def forward(
         self, img: Tensor, target: dict[str, Union[Tensor, TVTensor]]
     ) -> tuple[Tensor, dict[str, Union[Tensor, TVTensor]]]:
@@ -116,9 +185,14 @@ class Transforms(nn.Module):
 
         img = self.color_jitter(img)
         img, target = self.random_horizontal_flip(img, target)
-        img, target = self.scale_jitter(img, target)
+        img, target = self._resize_short_edge(img, target)
+        img, target = self._safe_random_square_crop(img, target)
         img, target = self.pad(img, target)
-        img, target = self.random_crop(img, target)
+        if img.shape[-2:] != self.img_size:
+            img = F.resize(img, self.img_size, interpolation=F.InterpolationMode.BILINEAR)
+            target["masks"] = F.resize(
+                target["masks"], self.img_size, interpolation=F.InterpolationMode.NEAREST
+            )
 
         valid = target["masks"].flatten(1).any(1)
         if not valid.any():

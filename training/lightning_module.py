@@ -251,6 +251,9 @@ class LightningModule(lightning.LightningModule):
                 open_vocab_logits=ov_logits,
                 text_priors=text_priors,
             )
+            if i != len(mask_logits_per_block) - 1:
+                aux_weight = getattr(self, "aux_weight", 1.0)
+                losses = {key: value * aux_weight for key, value in losses.items()}
 
             # 添加 block 后缀
             block_postfix = self.block_postfix(i)
@@ -258,6 +261,23 @@ class LightningModule(lightning.LightningModule):
             losses_all_blocks |= losses
 
         loss_total = self.criterion.loss_total(losses_all_blocks, self.log)
+        if class_logits_per_block:
+            no_object_ratio = (
+                class_logits_per_block[-1].softmax(dim=-1)[..., -1].mean().detach()
+            )
+            self.log(
+                "stats/no_object_ratio",
+                no_object_ratio,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                sync_dist=True,
+            )
+            if no_object_ratio > 0.6 and self.trainer.is_global_zero:
+                rank_zero_info(
+                    "High no-object ratio detected (%.3f). Consider adjusting thresholds.",
+                    float(no_object_ratio),
+                )
 
         extra_losses = {}
         if self.distill_feat_weight > 0 and self.teacher_backbone is not None:

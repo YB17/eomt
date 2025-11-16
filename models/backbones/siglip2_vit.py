@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.layers import DropPath
+from torch.utils.checkpoint import checkpoint
 
 from eomt.modules.lora import LoRAInjectionStats, inject_lora, summarize_lora
 
@@ -374,6 +375,7 @@ class SigLIP2ViTBackbone(nn.Module):
         self.patch_drop = _Identity()
         self.norm_pre = _Identity()
         self.norm = self.vision.post_layernorm
+        self.use_gradient_checkpointing = False
 
         self.lora_stats: Optional[LoRAInjectionStats] = None
         if lora_cfg and lora_cfg.get("ENABLED", lora_cfg.get("enabled", False)):
@@ -401,6 +403,9 @@ class SigLIP2ViTBackbone(nn.Module):
         # 修复：添加 backbone 属性避免循环引用
         # 当作为 teacher 使用时，common.py 会检查这个属性
         self.backbone = self.vision  # 指向 vision model，而不是 self
+
+    def set_gradient_checkpointing(self, enabled: bool = True) -> None:
+        self.use_gradient_checkpointing = bool(enabled)
     # ---------------------------------------------------------------------
     # model loading utilities
     # ---------------------------------------------------------------------
@@ -629,7 +634,10 @@ class SigLIP2ViTBackbone(nn.Module):
 
         outputs: List[torch.Tensor] = []
         for idx, block in enumerate(self.blocks):
-            tokens = block(tokens)
+            if self.use_gradient_checkpointing and self.training:
+                tokens = checkpoint(block, tokens)
+            else:
+                tokens = block(tokens)
             if idx in self.out_indices:
                 outputs.append(self.norm(tokens))
         if -1 in self.out_indices or (len(outputs) == 0):
