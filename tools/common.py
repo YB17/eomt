@@ -6,12 +6,13 @@ import json
 import logging
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence, Tuple
 
 import torch
 import yaml
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
-from lightning.pytorch.loggers import CSVLogger
+from lightning.pytorch.loggers import CSVLogger, WandbLogger
+from lightning.pytorch.loggers.logger import Logger as LightningLoggerBase
 
 from eomt.data.coco_ov_vocab import COCO_STUFF_53, COCO_THINGS_80, SYNONYMS, build_templates
 from eomt.datasets.coco_panoptic_directory import COCOPanopticDirectory
@@ -282,6 +283,135 @@ def build_module(
     return module
 
 
+def _build_wandb_logger(
+    cfg: Dict[str, Any],
+    output_dir: Path,
+) -> Optional[WandbLogger]:
+    logging_cfg = cfg.get("LOGGING", {})
+    wandb_cfg = logging_cfg.get("WANDB", {})
+    if not bool(wandb_cfg.get("ENABLED", False)):
+        return None
+
+    data_cfg = cfg.get("DATA", {})
+    tags = list(wandb_cfg.get("TAGS", []) or [])
+    stage_tag = output_dir.name
+    if stage_tag and stage_tag not in tags:
+        tags.append(stage_tag)
+    dataset_tag = data_cfg.get("DATASET")
+    if dataset_tag and dataset_tag not in tags:
+        tags.append(str(dataset_tag))
+
+    project = wandb_cfg.get("PROJECT") or stage_tag or "eomt"
+    run_name = wandb_cfg.get("NAME") or stage_tag
+    wandb_logger = WandbLogger(
+        project=project,
+        entity=wandb_cfg.get("ENTITY"),
+        name=run_name,
+        save_dir=str(output_dir),
+        group=wandb_cfg.get("GROUP"),
+        job_type=wandb_cfg.get("JOB_TYPE"),
+        tags=tags,
+        log_model=bool(wandb_cfg.get("LOG_MODEL", False)),
+        mode=wandb_cfg.get("MODE", "online"),
+        resume=wandb_cfg.get("RESUME", "never"),
+        notes=wandb_cfg.get("NOTES"),
+        id=wandb_cfg.get("ID"),
+    )
+    return wandb_logger
+
+
+def _maybe_find_wandb_logger(
+    logger: Optional[LightningLoggerBase | Iterable[LightningLoggerBase]],
+) -> Optional[WandbLogger]:
+    if logger is None:
+        return None
+    if isinstance(logger, WandbLogger):
+        return logger
+    if isinstance(logger, Iterable):
+        for entry in logger:
+            found = _maybe_find_wandb_logger(entry)
+            if found is not None:
+                return found
+    return None
+
+
+def _log_wandb_metadata(
+    cfg: Dict[str, Any],
+    module: MaskClassificationPanoptic,
+    datamodule: COCOPanopticDirectory,
+    steps_per_epoch: int,
+    output_dir: Path,
+    logger: Optional[LightningLoggerBase | Iterable[LightningLoggerBase]],
+) -> None:
+    wandb_logger = _maybe_find_wandb_logger(logger)
+    if wandb_logger is None:
+        return
+
+    wandb_cfg = cfg.get("LOGGING", {}).get("WANDB", {})
+    experiment = wandb_logger.experiment
+    if wandb_cfg.get("LOG_CONFIG", True):
+        experiment.config.update(cfg, allow_val_change=True)
+
+    train_dataset = getattr(datamodule, "train_dataset", None)
+    val_dataset = getattr(datamodule, "val_dataset", None)
+    data_cfg = cfg.get("DATA", {})
+    dataset_meta = {
+        "root": data_cfg.get("ROOT"),
+        "train_split": data_cfg.get("TRAIN_SPLIT"),
+        "val_split": data_cfg.get("VAL_SPLIT"),
+        "train_samples": len(train_dataset) if train_dataset is not None else None,
+        "val_samples": len(val_dataset) if val_dataset is not None else None,
+        "img_max": data_cfg.get("TRAIN_RES_MAX"),
+        "batch_size": getattr(datamodule, "batch_size", data_cfg.get("BATCH_SIZE")),
+        "num_workers": getattr(datamodule, "num_workers", data_cfg.get("NUM_WORKERS")),
+    }
+
+    solver_cfg = cfg.get("SOLVER", {})
+    max_epochs = int(solver_cfg.get("EPOCHS", 1))
+    warmup_steps = list(module.warmup_steps) if module.warmup_steps is not None else []
+    training_meta = {
+        "steps_per_epoch": steps_per_epoch,
+        "total_epochs": max_epochs,
+        "total_optimization_steps": steps_per_epoch * max_epochs,
+        "warmup_steps": warmup_steps,
+        "poly_power": module.poly_power,
+        "lr_head": solver_cfg.get("LR_HEAD"),
+        "lr_lora": solver_cfg.get("LR_LORA", solver_cfg.get("LR_HEAD")),
+        "llrd": module.llrd,
+        "weight_decay": module.weight_decay,
+        "output_dir": str(output_dir),
+        "resume": bool(wandb_cfg.get("RESUME", False)),
+    }
+
+    experiment.config.update(
+        {
+            "dataset_meta": dataset_meta,
+            "training_meta": training_meta,
+            "stage": output_dir.name,
+        },
+        allow_val_change=True,
+    )
+
+    total_params = sum(p.numel() for p in module.parameters())
+    trainable_params = sum(p.numel() for p in module.parameters() if p.requires_grad)
+    summary_payload = {
+        "parameters/total": total_params,
+        "parameters/trainable": trainable_params,
+        "parameters/frozen": total_params - trainable_params,
+        "classes/num_classes": module.num_classes,
+        "classes/stuff": len(getattr(module, "stuff_classes", [])),
+    }
+    experiment.summary.update(summary_payload)
+
+    watch_cfg = wandb_cfg.get("WATCH", {})
+    if watch_cfg.get("ENABLED", True):
+        wandb_logger.watch(
+            module,
+            log=watch_cfg.get("LOG", "gradients"),
+            log_freq=int(watch_cfg.get("LOG_FREQ", 250)),
+        )
+
+
 def trainer_kwargs(
     cfg: Dict[str, Any], output_dir: Path, resume: bool = False
 ) -> Tuple[Dict[str, Any], Optional[str]]:
@@ -290,13 +420,18 @@ def trainer_kwargs(
         LearningRateMonitor(logging_interval="epoch"),
         ModelCheckpoint(save_last=True, save_top_k=-1, every_n_epochs=5),
     ]
-    logger = CSVLogger(save_dir=str(output_dir), name="logs")
+    loggers: List[LightningLoggerBase] = []
+    csv_logger = CSVLogger(save_dir=str(output_dir), name="logs")
+    loggers.append(csv_logger)
+    wandb_logger = _build_wandb_logger(cfg, output_dir)
+    if wandb_logger is not None:
+        loggers.append(wandb_logger)
     kwargs: Dict[str, Any] = {
         "max_epochs": int(solver_cfg.get("EPOCHS", 12)),
         "gradient_clip_val": float(solver_cfg.get("CLIP_GRAD", 1.0)),
         "default_root_dir": str(output_dir),
         "callbacks": callbacks,
-        "logger": logger,
+        "logger": loggers if len(loggers) > 1 else loggers[0],
         "precision": cfg.get("TRAINER", {}).get("PRECISION", "16-mixed"),
     }
     resume_path: Optional[str] = None
@@ -331,6 +466,7 @@ def build_training_components(
             LOGGER.info("LoRA trainable params: %d", summary.total_trainable)
 
     kwargs, resume_path = trainer_kwargs(cfg, output_dir, resume=resume)
+    _log_wandb_metadata(cfg, module, datamodule, steps_per_epoch, output_dir, kwargs.get("logger"))
     return module, datamodule, kwargs, resume_path
 
 

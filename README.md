@@ -201,6 +201,32 @@ python tools/test_net.py \
 pytest -q tests/test_siglip2_ov.py
 ```
 
+### Weights & Biases logging
+
+Enable `LOGGING.WANDB.ENABLED` and provide your project metadata to capture Stage A/B training statistics (loss curves, PQ, LR schedulers, dataset sizes, parameter counts, gradients, etc.) in Weights & Biases. The integration automatically uploads:
+
+* the resolved YAML configuration alongside derived training metadata (steps per epoch, warmup schedule, etc.);
+* dataset statistics (train/val counts, resolution, batch size, worker count);
+* model statistics (trainable vs. frozen parameter totals, stuff/thing class counts);
+* gradient and parameter norms through `wandb.watch` (disable via `LOGGING.WANDB.WATCH.ENABLED false`).
+
+Example Stage A run that logs to W&B:
+
+```bash
+export WANDB_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+python tools/train_net.py \
+  --config-file configs/coco_panoptic_siglip2_eomt_ov.yaml \
+  MODEL.BACKBONE.LORA.ENABLED false \
+  MODEL.BACKBONE.FREEZE true \
+  OUTPUT_DIR runs/coco_eomt_siglip2_ov/stageA \
+  LOGGING.WANDB.ENABLED true \
+  LOGGING.WANDB.PROJECT eomt-panoptic \
+  LOGGING.WANDB.NAME stageA-freeze \
+  LOGGING.WANDB.TAGS [stageA,coco]
+```
+
+Optional knobs include `LOGGING.WANDB.GROUP`, `LOGGING.WANDB.NOTES`, `LOGGING.WANDB.MODE`, and `LOGGING.WANDB.RESUME` for distributed or offline workflows.
+
 **Results placeholder.** Full COCO panoptic metrics (`PQ_all`, `PQ_th`, `PQ_st`, `PQ_unseen`) are logged during training; populate the table below after running Stage B/Stage C on your hardware.
 
 ## Model Zoo
