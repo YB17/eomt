@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 from transformers.models.mask2former.modeling_mask2former import (
     Mask2FormerHungarianMatcher,
-    pair_wise_dice_loss,
     pair_wise_sigmoid_cross_entropy_loss,
     sample_point,
 )
@@ -17,12 +16,14 @@ class OpenVocabHungarianMatcher(Mask2FormerHungarianMatcher):
 
     def __init__(
         self,
-        lambda_mask_iou: float = 2.0,
-        lambda_bce: float = 2.0,
-        lambda_cls: float = 1.0,
+        matcher_weights: Optional[dict[str, float]] = None,
         kl_weight: float = 0.0,
         num_points: int = 12544,
     ) -> None:
+        weights = matcher_weights or {}
+        lambda_mask_iou = float(weights.get("LAMBDA_MASK_IOU", 2.0))
+        lambda_bce = float(weights.get("LAMBDA_BCE", 1.0))
+        lambda_cls = float(weights.get("LAMBDA_CLS", 0.5))
         super().__init__(cost_class=lambda_cls, cost_mask=lambda_bce, cost_dice=lambda_mask_iou, num_points=num_points)
         self.lambda_mask_iou = lambda_mask_iou
         self.lambda_bce = lambda_bce
@@ -61,7 +62,13 @@ class OpenVocabHungarianMatcher(Mask2FormerHungarianMatcher):
             sampled_pred_mask = sample_point(pred_mask, pred_coordinates, align_corners=False).squeeze(1)
 
             cost_mask = pair_wise_sigmoid_cross_entropy_loss(sampled_pred_mask, sampled_target_mask)
-            cost_dice = pair_wise_dice_loss(sampled_pred_mask, sampled_target_mask)
+            prob_pred = sampled_pred_mask.sigmoid()
+            prob_target = sampled_target_mask
+            intersection = torch.einsum("qn,tn->qt", prob_pred, prob_target)
+            pred_area = prob_pred.sum(-1).unsqueeze(1)
+            tgt_area = prob_target.sum(-1).unsqueeze(0)
+            union = pred_area + tgt_area - intersection
+            cost_iou = 1.0 - (intersection / (union + 1e-6))
 
             prob_closed = class_queries_logits[i].softmax(-1)
             gt_classes = class_labels[i]
@@ -98,7 +105,7 @@ class OpenVocabHungarianMatcher(Mask2FormerHungarianMatcher):
                     gather_ids = torch.clamp(gt_classes[unseen_flags], max=prob_open.shape[-1] - 1)
                     cost_class[:, unseen_flags] = -prob_open[:, gather_ids]
 
-            total_cost = self.lambda_bce * cost_mask + self.lambda_mask_iou * cost_dice + self.lambda_cls * cost_class
+            total_cost = self.lambda_bce * cost_mask + self.lambda_mask_iou * cost_iou + self.lambda_cls * cost_class
             total_cost = torch.nan_to_num(total_cost, 0.0, 0.0, 0.0)
             row_ind, col_ind = linear_sum_assignment_safe(total_cost)
             indices.append((row_ind, col_ind))

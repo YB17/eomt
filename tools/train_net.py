@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+import torch
 from lightning.pytorch import Trainer
 
 from tools.common import build_training_components, default_argument_parser, load_config
@@ -14,6 +15,7 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
+    torch.set_float32_matmul_precision("high")
 
     cfg = load_config(args.config_file, args.opts)
     module, datamodule, trainer_kwargs, resume_path = build_training_components(

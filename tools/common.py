@@ -104,20 +104,44 @@ def load_config(path: str, overrides: Sequence[str]) -> Dict[str, Any]:
 # builders
 # ---------------------------------------------------------------------------
 
+def _resolve_resolution(cfg: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+    res_cfg = cfg.get("RESOLUTION", {})
+    preset = str(res_cfg.get("PRESET", "Safe"))
+    preset_key = preset.upper()
+    preset_cfg = res_cfg.get(preset_key, {})
+    return preset, preset_cfg
+
+
 def build_datamodule(cfg: Dict[str, Any]) -> COCOPanopticDirectory:
     data_cfg = cfg.get("DATA", {})
+    preset, preset_cfg = _resolve_resolution(cfg)
     batch_size = int(data_cfg.get("BATCH_SIZE", 2))
     num_workers = int(data_cfg.get("NUM_WORKERS", 4))
-    img_max = int(data_cfg.get("TRAIN_RES_MAX", 1024))
-    img_size = (img_max, img_max)
+    crop_sizes = preset_cfg.get("CROP_SIZES") or [data_cfg.get("TRAIN_RES_MAX", 640)]
+    img_max = int(max(crop_sizes))
+    short_edge = preset_cfg.get("SHORT_EDGE")
+    if short_edge is not None:
+        short_edge = (int(short_edge[0]), int(short_edge[1]))
+    train_transform_cfg = {
+        "short_edge": short_edge,
+        "long_edge_max": int(preset_cfg.get("LONG_EDGE_MAX", img_max)),
+        "crop_sizes": [int(v) for v in crop_sizes],
+        "color_jitter": bool(preset_cfg.get("COLOR_JITTER", True)),
+        "flip_prob": float(preset_cfg.get("FLIP_PROB", 0.5)),
+        "keep_full_instances": True,
+    }
     datamodule = COCOPanopticDirectory(
         path=data_cfg.get("ROOT", ""),
         stuff_classes=list(range(len(COCO_THINGS_80), len(COCO_THINGS_80) + len(COCO_STUFF_53))),
         batch_size=batch_size,
         num_workers=num_workers,
-        img_size=img_size,
+        img_size=(img_max, img_max),
         num_classes=len(COCO_THINGS_80) + len(COCO_STUFF_53),
         check_empty_targets=data_cfg.get("CHECK_EMPTY_TARGETS", True),
+        pin_memory=bool(data_cfg.get("PIN_MEMORY", True)),
+        persistent_workers=bool(data_cfg.get("PERSISTENT_WORKERS", True)),
+        train_transform_cfg=train_transform_cfg,
+        resolution_preset=preset,
     )
     datamodule.setup("fit")
     return datamodule
@@ -140,7 +164,13 @@ def build_open_vocab_head(cfg: Dict[str, Any]) -> Optional[OpenVocabHead]:
         with Path(custom_synonyms).open("r", encoding="utf-8") as handle:
             synonyms.update(json.load(handle))
 
-    per_class_bias = ov_cfg.get("PER_CLASS_BIAS", None)
+    total_classes = len(COCO_THINGS_80) + len(COCO_STUFF_53)
+    per_class_bias_cfg = ov_cfg.get("PER_CLASS_BIAS", None)
+    per_class_bias: Optional[torch.Tensor | float]
+    if isinstance(per_class_bias_cfg, str) and per_class_bias_cfg.lower() == "auto":
+        per_class_bias = torch.zeros(total_classes)
+    else:
+        per_class_bias = per_class_bias_cfg
     head = OpenVocabHead(
         text_model_id=text_model_id,
         templates_things=templates["things"],
@@ -157,6 +187,11 @@ def build_open_vocab_head(cfg: Dict[str, Any]) -> Optional[OpenVocabHead]:
         multilingual_templates=templates.get("multilingual"),
         per_class_bias=per_class_bias,
     )
+    if hasattr(head, "text_model") and head.text_model is not None:
+        head.text_model.eval()
+        for param in head.text_model.parameters():
+            param.requires_grad_(False)
+    return head
     return head
 
 
@@ -253,11 +288,33 @@ def build_module(
     teacher_backbone: Optional[torch.nn.Module],
     start_steps: Sequence[int],
     end_steps: Sequence[int],
+    steps_per_epoch: int,
+    backbone_frozen: bool,
 ) -> MaskClassificationPanoptic:
     solver_cfg = cfg.get("SOLVER", {})
     loss_cfg = cfg.get("LOSS", {})
     anneal_cfg = cfg.get("ANNEAL", {})
     data_cfg = cfg.get("DATA", {})
+    seg_cfg = loss_cfg.get("SEG", {})
+    ov_cfg = loss_cfg.get("OV", {})
+    aux_cfg = loss_cfg.get("AUX", {})
+    match_cfg = loss_cfg.get("MATCH", {})
+    res_cfg = cfg.get("RESOLUTION", {})
+    perfplus_cfg = res_cfg.get("PERFPLUS", {})
+    stage_cfg = {
+        "stage": cfg.get("STAGE", "A"),
+        "global_batch_size": int(cfg.get("GLOBAL_BATCH_SIZE", 0)),
+        "backbone_freeze": cfg.get("BACKBONE_FREEZE", backbone_frozen),
+        "use_lora": cfg.get("USE_LORA", cfg.get("MODEL", {}).get("BACKBONE", {}).get("LORA", {}).get("ENABLED", False)),
+        "resolution_preset": getattr(datamodule, "resolution_preset", "Safe"),
+        "eval_interval": int(cfg.get("EVAL", {}).get("INTERVAL_EPOCHS", 1)),
+        "seed": cfg.get("SEED", 0),
+        "epochs": int(cfg.get("EPOCHS", solver_cfg.get("EPOCHS", 1))),
+        "output_dir": cfg.get("OUTPUT_DIR", "outputs"),
+        "best_ckpt_name": cfg.get("STAGE_BEST_CKPT", f"{str(cfg.get('STAGE', 'A')).lower()}_best.ckpt"),
+        "perfplus_memory_limit_gb": float(perfplus_cfg.get("MEMORY_LIMIT_GB", 23.5)),
+        "perfplus_monitor_iters": int(perfplus_cfg.get("MONITOR_ITERS", 50)),
+    }
 
     img_max = int(data_cfg.get("TRAIN_RES_MAX", 1024))
     module = MaskClassificationPanoptic(
@@ -274,7 +331,21 @@ def build_module(
         weight_decay=float(solver_cfg.get("WD", 0.05)),
         poly_power=float(anneal_cfg.get("FACTOR", 0.9)),
         warmup_steps=list(solver_cfg.get("WARMUP_STEPS", [500, 1000])),
-        open_vocab_kl_weight=float(loss_cfg.get("OV", {}).get("KL_TEXT_WEIGHT", 0.0)),
+        open_vocab_kl_weight=float(ov_cfg.get("KL_TEXT_WEIGHT", 0.0)),
+        open_vocab_kl_temperature=float(ov_cfg.get("KL_TEMPERATURE", 2.0)),
+        mask_coefficient=float(seg_cfg.get("LAMBDA_BCE", 2.0)),
+        dice_coefficient=float(seg_cfg.get("LAMBDA_DICE", 1.0)),
+        class_coefficient=float(ov_cfg.get("CE_WEIGHT", 1.0)),
+        matcher_weights=match_cfg,
+        aux_weight=float(aux_cfg.get("WEIGHT", 0.3)),
+        stage_config=stage_cfg,
+        steps_per_epoch=steps_per_epoch,
+        stage_head_lr=float(solver_cfg.get("LR_HEAD", 5e-4)),
+        stage_other_lr=float(solver_cfg.get("LR_OTHER", solver_cfg.get("LR_HEAD", 5e-4))),
+        stage_wd_head=float(solver_cfg.get("WD_HEAD", 0.0)),
+        stage_wd_other=float(solver_cfg.get("WD_OTHER", solver_cfg.get("WD", 0.05))),
+        stage_betas=tuple(solver_cfg.get("BETAS", (0.9, 0.98))),
+        stage_warmup_ratio=float(solver_cfg.get("WARMUP_RATIO", 0.05)),
         distill_feat_weight=float(loss_cfg.get("DISTILL", {}).get("FEAT_ALIGN", 0.0)),
         distill_itc_weight=float(loss_cfg.get("DISTILL", {}).get("ITC_WEIGHT", 0.0)),
         distill_temperature=float(loss_cfg.get("DISTILL", {}).get("TEMPERATURE", 0.07)),

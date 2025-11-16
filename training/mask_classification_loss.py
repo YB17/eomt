@@ -9,7 +9,7 @@
 # ---------------------------------------------------------------
 
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 import torch.distributed as dist
 import torch
 import torch.nn as nn
@@ -36,6 +36,7 @@ class MaskClassificationLoss(Mask2FormerLoss):
         open_vocab_enabled: bool = False,
         open_vocab_kl_weight: float = 0.0,
         open_vocab_kl_teacher_temp: float = 2.0,
+        matcher_weights: Optional[dict[str, float]] = None,
     ):
         nn.Module.__init__(self)
         self.num_points = num_points
@@ -49,15 +50,14 @@ class MaskClassificationLoss(Mask2FormerLoss):
         self.open_vocab_enabled = open_vocab_enabled
         self.open_vocab_kl_weight = open_vocab_kl_weight
         self.open_vocab_kl_teacher_temp = open_vocab_kl_teacher_temp
+        self.matcher_weights = matcher_weights or {}
         empty_weight = torch.ones(self.num_labels + 1)
         empty_weight[-1] = self.eos_coef
         self.register_buffer("empty_weight", empty_weight)
 
         if self.open_vocab_enabled:
             self.matcher: Mask2FormerHungarianMatcher = OpenVocabHungarianMatcher(
-                lambda_mask_iou=dice_coefficient,
-                lambda_bce=mask_coefficient,
-                lambda_cls=class_coefficient,
+                matcher_weights=self.matcher_weights,
                 kl_weight=open_vocab_kl_weight,
                 num_points=num_points,
             )
@@ -136,49 +136,26 @@ class MaskClassificationLoss(Mask2FormerLoss):
             ce_loss = ce_loss + F.cross_entropy(logits, labels, reduction="sum")
             ce_count += len(src_idx)
 
-            # if text_priors is not None and self.open_vocab_kl_weight > 0:
-            #     priors = text_priors[batch_idx]
-            #     if priors.dim() == 3:
-            #         priors = priors[src_idx]
-            #     elif priors.dim() == 2:
-            #         priors = priors[tgt_idx]
-            #     else:
-            #         priors = priors.expand_as(logits)
-            #     priors = F.softmax(priors, dim=-1)
-            #     student = F.log_softmax(logits, dim=-1)
-            #     kl_loss = kl_loss + F.kl_div(student, priors, reduction="batchmean")
-            #     kl_count += 1
             if text_priors is not None and self.open_vocab_kl_weight > 0:
-                priors = text_priors[b]                     # [Q,C] or [B,Q,C]已在上游保证
-                if priors.dim() == 2:                       # [Q,C]
-                    priors = priors[src_idx]                # 和 matched queries 对齐
-                elif priors.dim() == 1:                     # 罕见：全局 [C]
+                priors = text_priors[batch_idx]
+                if priors.dim() == 3:
+                    priors = priors[src_idx]
+                elif priors.dim() == 2:
+                    priors = priors[tgt_idx]
+                elif priors.dim() == 1:
                     priors = priors.unsqueeze(0).expand_as(logits)
                 else:
-                    # 你当前的 [B,Q,C] 分支同理取 src_idx
-                    priors = priors[src_idx]
-
-                # ① teacher 不参与反向
+                    priors = priors.expand_as(logits)
                 priors = priors.detach()
-
-                # ② teacher 温度（“更平滑”）：tau_text > 1，建议 2~5 之间做 grid-search
                 tau_text = getattr(self, "open_vocab_kl_teacher_temp", 2.0)
-                priors = priors / tau_text
-
-                # ③ 如果学生 logits 启用了能量拒识/置 -inf（可选）
-                #    则在 teacher 端屏蔽相同位置，避免 teacher 在被屏蔽类上分配概率
-                reject_mask = torch.isinf(logits)           # [num_matched, C]
-                priors = priors.masked_fill(reject_mask, float("-inf"))
-
-                # ④ 分布化
-                p_text   = F.softmax(priors, dim=-1)        # teacher: probs
-                log_p_st = F.log_softmax(logits, dim=-1)    # student: log-probs
-
-                # ⑤ 归一化：按 matched queries 平均，更直观稳健
-                kl_loss += F.kl_div(log_p_st, p_text, reduction="sum")
+                priors = priors / max(tau_text, 1e-6)
+                reject_mask = torch.isinf(logits)
+                if reject_mask.any():
+                    priors = priors.masked_fill(reject_mask, float("-inf"))
+                teacher_probs = F.softmax(priors, dim=-1)
+                student_log = F.log_softmax(logits, dim=-1)
+                kl_loss = kl_loss + F.kl_div(student_log, teacher_probs, reduction="sum")
                 kl_count += logits.size(0)
-
-
 
         if ce_count > 0:
             ce_loss = ce_loss / ce_count

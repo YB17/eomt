@@ -201,7 +201,7 @@ class EoMT(nn.Module):
                     device=x.device,
                 )
                 interpolated = F.interpolate(
-                    mask_logits,
+                    mask_logits.sigmoid(),
                     self.encoder.backbone.patch_embed.grid_size,
                     mode="bilinear",
                 )
@@ -213,7 +213,7 @@ class EoMT(nn.Module):
                     : self.num_q,
                     self.num_q + self.encoder.backbone.num_prefix_tokens :,
                 ] = (
-                    interpolated > 0
+                    interpolated > 0.5
                 )
                 attn_mask = self._disable_attn_mask(
                     attn_mask,
