@@ -62,8 +62,8 @@ DATA:
 SOLVER:
   OPTIM: AdamW
   WD: 0.05
-  LR_HEAD: 5.0e-4
-  LR_LORA: 1.0e-4
+  LR_HEAD: 2.0e-4
+  LR_LORA: 4.0e-4
   LLRD: 0.8
   CLIP_GRAD: 1.0
   EPOCHS: 12
@@ -78,7 +78,12 @@ TEST:
 OUTPUT_DIR: "<OUTPUT_DIR>"
 
 TRAINER:
-  PRECISION: "32"
+  PRECISION: "16-mixed"  # 推荐混合精度以提高速度
+  DEVICES: 8             # 使用的 GPU 数量
+  STRATEGY: "ddp_find_unused_parameters_true"        # 分布式策略
+  NUM_NODES: 1           # 节点数（单机多卡为1）
+  ACCELERATOR: "gpu"     # 加速器类型
+  SYNC_BATCHNORM: true
 LOGGING:
   WANDB:
     ENABLED: false

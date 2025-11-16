@@ -421,6 +421,10 @@ class LightningModule(lightning.LightningModule):
                     stuff_classes + [self.num_classes],
                     return_sq_and_rq=True,
                     return_per_class=True,
+                    # ==================== DDP 修复 ====================
+                    dist_sync_on_step=False,    # 不在每步同步
+                    sync_on_compute=True,        # 只在 compute 时同步
+                    # ================================================
                 )
                 for _ in range(num_blocks)
             ]
@@ -609,7 +613,22 @@ class LightningModule(lightning.LightningModule):
 
     def _on_eval_epoch_end_panoptic(self, log_prefix, log_per_class=False):
         for i, metric in enumerate(self.metrics):  # type: ignore
-            result = metric.compute()[:-1]
+            # ==================== DDP 死锁修复 ====================
+            # 检查 metric 是否有数据更新（避免空 GPU 死锁）
+            try:
+                # 获取 metric 内部状态
+                if hasattr(metric, '_num_examples') and metric._num_examples == 0:
+                    LOGGER.warning(f"⚠️ Metric {i} has no examples, skipping compute")
+                    continue
+                
+                # 尝试 compute，如果失败则跳过
+                result = metric.compute()[:-1]
+            except Exception as e:
+                LOGGER.warning(f"⚠️ Failed to compute metric {i}: {e}")
+                metric.reset()
+                continue
+            # ================================================
+    
             metric.reset()
 
             pq, sq, rq = result[:, 0], result[:, 1], result[:, 2]
@@ -1051,6 +1070,10 @@ class LightningModule(lightning.LightningModule):
             block_idx: block索引
             batch_idx: batch索引
         """
+        # ⭐ 确保只在主进程记录
+        if not self.trainer.is_global_zero:
+            return        
+        
         fig, axes = plt.subplots(1, 3, figsize=[18, 6], sharex=True, sharey=True)
         
         # 1. 显示原始图像

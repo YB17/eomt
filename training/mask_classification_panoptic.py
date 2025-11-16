@@ -137,7 +137,7 @@ class MaskClassificationPanoptic(LightningModule):
                 open_vocab_logits=ov_logits if self.open_vocab_enabled else None,
             )
             self.update_metrics_panoptic(preds, targets, is_crowds, i)
-        if batch_idx % 5 == 0:  # 每5个batch可视化一次，或者完全禁用
+        if batch_idx % 5 == 0 and self.trainer.is_global_zero:  # 每5个batch可视化一次，或者完全禁用
             self.plot_panoptic(
                 img=imgs[0],  # 第一张图像
                 targets=original_targets[0],  # 对应的target

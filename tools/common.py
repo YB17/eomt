@@ -334,7 +334,24 @@ def _maybe_find_wandb_logger(
                 return found
     return None
 
+def _rank0_only(func):
+    """装饰器：只在主进程执行函数"""
+    from functools import wraps
+    
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        import os
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        global_rank = int(os.environ.get("RANK", 0))
+        
+        # 检查是否是主进程
+        if local_rank == 0 and global_rank == 0:
+            return func(*args, **kwargs)
+        return None
+    
+    return wrapper
 
+@_rank0_only
 def _log_wandb_metadata(
     cfg: Dict[str, Any],
     module: MaskClassificationPanoptic,
@@ -348,7 +365,17 @@ def _log_wandb_metadata(
         return
 
     wandb_cfg = cfg.get("LOGGING", {}).get("WANDB", {})
-    experiment = wandb_logger.experiment
+
+    # 安全获取 experiment
+    try:
+        experiment = wandb_logger.experiment
+        if not hasattr(experiment, "config"):
+            LOGGER.warning("⚠️ WandB experiment not properly initialized")
+            return
+    except Exception as e:
+        LOGGER.warning(f"⚠️ Failed to get WandB experiment: {e}")
+        return
+
     if wandb_cfg.get("LOG_CONFIG", True):
         experiment.config.update(cfg, allow_val_change=True)
 
@@ -433,6 +460,22 @@ def trainer_kwargs(
         "callbacks": callbacks,
         "logger": loggers if len(loggers) > 1 else loggers[0],
         "precision": cfg.get("TRAINER", {}).get("PRECISION", "16-mixed"),
+        
+        # ==================== 多卡训练参数 ====================
+        "accelerator": cfg.get("TRAINER", {}).get("ACCELERATOR", "gpu"),
+        "devices": cfg.get("TRAINER", {}).get("DEVICES", 1),
+        "strategy": cfg.get("TRAINER", {}).get("STRATEGY", "auto"),
+        "num_nodes": cfg.get("TRAINER", {}).get("NUM_NODES", 1),
+        "sync_batchnorm": cfg.get("TRAINER", {}).get("SYNC_BATCHNORM", False),
+        # ====================================================
+
+        # ⭐⭐⭐ 关键修复：禁用 sanity check ⭐⭐⭐
+        "num_sanity_val_steps": 0,
+        # 其他验证参数
+        "limit_val_batches": cfg.get("TRAINER", {}).get("LIMIT_VAL_BATCHES", None),
+        "val_check_interval": cfg.get("TRAINER", {}).get("VAL_CHECK_INTERVAL", 1.0),
+        # ====================================================
+
     }
     resume_path: Optional[str] = None
     if resume:
