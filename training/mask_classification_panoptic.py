@@ -114,7 +114,9 @@ class MaskClassificationPanoptic(LightningModule):
         open_vocab_logits_per_layer = outputs.get("open_vocab_logits")
 
         is_crowds = [target["is_crowd"] for target in targets]
+        original_targets = targets
         targets = self.to_per_pixel_targets_panoptic(targets)
+        
 
         for i, (mask_logits, class_logits) in enumerate(
             list(zip(mask_logits_per_layer, class_logits_per_layer))
@@ -138,7 +140,7 @@ class MaskClassificationPanoptic(LightningModule):
         if batch_idx % 5 == 0:  # 每5个batch可视化一次，或者完全禁用
             self.plot_panoptic(
                 img=imgs[0],  # 第一张图像
-                targets=targets[0],  # 对应的target
+                targets=original_targets[0],  # 对应的target
                 mask_logits=mask_logits_per_layer[-1][0],  # 最后一个block的第一张图像的mask logits
                 class_logits=class_logits_per_layer[-1][0],  # 最后一个block的第一张图像的class logits
                 log_prefix="val",

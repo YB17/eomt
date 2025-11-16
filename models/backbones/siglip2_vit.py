@@ -47,9 +47,40 @@ class _SiglipPatchEmbed(nn.Module):
         if isinstance(patch_size, int):
             patch_size = (patch_size, patch_size)
         self.patch_size = patch_size
-        self.grid_size = (embeddings.image_size // patch_size[0], embeddings.image_size // patch_size[1])
+        
+        # 修复：处理 image_size 可能是 tuple 或 int 的情况
+        image_size = embeddings.image_size
+        if isinstance(image_size, (tuple, list)):
+            # OpenCLIP 格式：image_size 是 tuple (H, W)
+            self.grid_size = (image_size[0] // patch_size[0], image_size[1] // patch_size[1])
+        else:
+            # HuggingFace Transformers 格式：image_size 是 int
+            self.grid_size = (image_size // patch_size[0], image_size // patch_size[1])
+        
         self.num_patches = getattr(embeddings, "num_patches", self.grid_size[0] * self.grid_size[1])
         self.last_hw: Optional[tuple[int, int]] = None
+        
+        # 修复：安全地获取和保存 dtype
+        self._cached_dtype = self._get_proj_dtype()
+
+    def _get_proj_dtype(self) -> torch.dtype:
+        """安全地获取 projection 层的 dtype"""
+        # 尝试直接访问 weight (HuggingFace Transformers)
+        if hasattr(self.proj, 'weight'):
+            return self.proj.weight.dtype
+        # 尝试访问 proj 属性 (OpenCLIP PatchEmbed)
+        elif hasattr(self.proj, 'proj') and hasattr(self.proj.proj, 'weight'):
+            return self.proj.proj.weight.dtype
+        # 遍历查找第一个有 weight 的参数
+        for param in self.proj.parameters():
+            return param.dtype
+        # 默认返回 float32
+        return torch.float32
+
+    @property
+    def weight_dtype(self) -> torch.dtype:
+        """提供一个属性来访问 dtype"""
+        return self._cached_dtype
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
@@ -59,10 +90,20 @@ class _SiglipPatchEmbed(nn.Module):
                 f"Got {(H, W)} with patch size {self.patch_size}."
             )
         out = self.proj(x)
-        h, w = out.shape[-2:]
-        self.grid_size = (h, w)
+        
+        # 计算 grid_size
+        patch_h = H // self.patch_size[0]
+        patch_w = W // self.patch_size[1]
+        self.grid_size = (patch_h, patch_w)
         self.last_hw = (H, W)
-        return out.flatten(2).transpose(1, 2)
+        
+        # 根据输出维度决定是否需要 flatten
+        if out.dim() == 4:
+            # Transformers Conv2d: [B, C, H, W] -> [B, N, C]
+            return out.flatten(2).transpose(1, 2)
+        else:
+            # OpenCLIP PatchEmbed: 已经是 [B, N, C]
+            return out
 
 
 class _SiglipPosEmbed(nn.Module):
@@ -79,7 +120,14 @@ class _SiglipPosEmbed(nn.Module):
         if self.naflex:
             pos = self.embeddings.interpolate_pos_encoding(x, height, width)
         else:
-            pos = self.embeddings.position_embedding(self.embeddings.position_ids)
+            # 修复：兼容 nn.Parameter (OpenCLIP) 和 nn.Embedding (Transformers)
+            pos_emb = self.embeddings.position_embedding
+            if callable(pos_emb):
+                # HuggingFace: nn.Embedding 层
+                pos = pos_emb(self.embeddings.position_ids)
+            else:
+                # OpenCLIP: nn.Parameter 张量
+                pos = pos_emb
         return x + pos
 
 
@@ -231,6 +279,8 @@ class _OpenClipVisionAdapter(nn.Module):
 
         self.use_head = False
         self.head = _Identity()
+        # 修复：添加 backbone 属性避免循环引用
+        self.backbone = None  # 或者可以指向 self.encoder
 
 class _SiglipAttentionWrapper(nn.Module):
     def __init__(self, attention: nn.Module):
@@ -348,7 +398,9 @@ class SigLIP2ViTBackbone(nn.Module):
         std = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
         self.register_buffer("pixel_mean", mean)
         self.register_buffer("pixel_std", std)
-
+        # 修复：添加 backbone 属性避免循环引用
+        # 当作为 teacher 使用时，common.py 会检查这个属性
+        self.backbone = self.vision  # 指向 vision model，而不是 self
     # ---------------------------------------------------------------------
     # model loading utilities
     # ---------------------------------------------------------------------
@@ -569,7 +621,7 @@ class SigLIP2ViTBackbone(nn.Module):
         return self._apply_positional_encoding(x)
 
     def forward_features(self, x: torch.Tensor) -> List[torch.Tensor]:
-        dtype = self.patch_embed.proj.weight.dtype
+        dtype = self.patch_embed.weight_dtype
         tokens = self.patch_embed(x.to(dtype=dtype))
         tokens = self._apply_positional_encoding(tokens)
         tokens = self.patch_drop(tokens)

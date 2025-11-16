@@ -231,8 +231,17 @@ def build_teacher(cfg: Dict[str, Any]) -> Optional[torch.nn.Module]:
     if not hasattr(teacher, "backbone"):
         teacher.backbone = teacher  # type: ignore[attr-defined]
     teacher.eval()
+    
+    # 修复：强制 Teacher 使用 FP32，避免混合精度梯度问题
+    teacher = teacher.float()  # ✅ 关键修复！
     for param in teacher.parameters():
         param.requires_grad_(False)
+
+    # 额外保险：确保所有 buffer 也是 FP32
+    for name, buffer in teacher.named_buffers():
+        if buffer.dtype == torch.float16:
+            buffer.data = buffer.float()
+
     return teacher
 
 

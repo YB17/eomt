@@ -274,14 +274,27 @@ class LightningModule(lightning.LightningModule):
                     torch.ones(1, teacher_inputs.size(1), 1, 1, device=teacher_inputs.device, dtype=teacher_inputs.dtype),
                 )
                 teacher_inputs = (teacher_inputs - pixel_mean.to(teacher_inputs.device)) / pixel_std.to(teacher_inputs.device)
-                dtype = next(self.teacher_backbone.parameters()).dtype
-                teacher_feats = self.teacher_backbone.forward_features(teacher_inputs.to(dtype=dtype))
+                teacher_feats = self.teacher_backbone.forward_features(teacher_inputs.float())
+                teacher_feats = [feat.detach().float() for feat in teacher_feats]
+
             student_feats = outputs.get("backbone_tokens", [])
             if student_feats:
-                teacher_selected = teacher_feats[-len(student_feats):]
+                # 修复：从 student 特征中移除 query tokens，只保留图像tokens
+                num_queries = self.network.num_q  # 150
+                num_prefix = self.network.encoder.backbone.num_prefix_tokens  # 通常是0
+                
+                # 只提取图像tokens部分：去掉前面的 query tokens
+                student_feats_image_only = [
+                    feat[:, num_queries + num_prefix:, :] 
+                    for feat in student_feats
+                ]
+                
+                teacher_selected = teacher_feats[-len(student_feats_image_only):]
                 if teacher_selected:
-                    student_selected = student_feats[-len(teacher_selected):]
-                    extra_losses["distill_feat_align"] = compute_feat_align(student_selected, teacher_selected, self.distill_feat_weight)
+                    student_selected = student_feats_image_only[-len(teacher_selected):]
+                    extra_losses["distill_feat_align"] = compute_feat_align(
+                        student_selected, teacher_selected, self.distill_feat_weight
+                    )
 
         if (
             self.distill_itc_weight > 0
@@ -1068,7 +1081,27 @@ class LightningModule(lightning.LightningModule):
         
         block_postfix = self.block_postfix(block_idx)
         name = f"{log_prefix}_panoptic_{batch_idx}{block_postfix}"
-        self.trainer.logger.experiment.log({name: [wandb.Image(Image.open(buf))]})
+        # self.trainer.logger.experiment.log({name: [wandb.Image(Image.open(buf))]})
+        # 兼容不同的 logger
+        if self.trainer.logger is not None:
+            logger = self.trainer.logger
+            if hasattr(logger, 'experiment') and hasattr(logger.experiment, 'log'):
+                # WandB logger
+                import wandb
+                logger.experiment.log({name: [wandb.Image(Image.open(buf))]})
+            elif hasattr(logger, 'log_image'):
+                # TensorBoard logger
+                from PIL import Image as PILImage
+                img_pil = PILImage.open(buf)
+                logger.log_image(name, [img_pil], self.global_step)
+            else:
+                # 其他 logger：保存到文件
+                from pathlib import Path
+                output_dir = Path(self.trainer.log_dir) / "panoptic_vis"
+                output_dir.mkdir(exist_ok=True, parents=True)
+                img_path = output_dir / f"{name}_step{self.global_step}.png"
+                Image.open(buf).save(img_path)
+                print(f"✅ Panoptic 可视化已保存到: {img_path}")
 
     @torch.compiler.disable
     def _create_panoptic_visualization_gt(self, targets):

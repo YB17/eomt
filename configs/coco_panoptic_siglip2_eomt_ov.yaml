@@ -3,8 +3,9 @@ MODEL:
     NAME: ViT-B-16-SigLIP2-512
     MODEL_ID: "/home/host/siglip2/"
     DROP_PATH: 0.1
-    NAFLEX: true
+    NAFLEX: false
     FREEZE: false
+    FP16: false
     LORA:
       ENABLED: true
       LAST_N_LAYERS: 12
@@ -53,8 +54,8 @@ DATA:
   ROOT: "/home/host/coco"
   TRAIN_SPLIT: train2017
   VAL_SPLIT: val2017
-  TRAIN_RES_MIN: 640
-  TRAIN_RES_MAX: 1024
+  TRAIN_RES_MIN: 512
+  TRAIN_RES_MAX: 512
   BATCH_SIZE: 4
   NUM_WORKERS: 8
   OPEN_VOCAB_SPLIT: "ovp_val"
@@ -75,3 +76,6 @@ TEST:
   MIN_AREA: 256
   OV_LOGIT_BIAS: 0.0
 OUTPUT_DIR: "<OUTPUT_DIR>"
+
+TRAINER:
+  PRECISION: "32"
