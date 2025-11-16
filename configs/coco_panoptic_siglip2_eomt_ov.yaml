@@ -79,3 +79,22 @@ OUTPUT_DIR: "<OUTPUT_DIR>"
 
 TRAINER:
   PRECISION: "32"
+LOGGING:
+  WANDB:
+    ENABLED: false
+    PROJECT: null
+    ENTITY: null
+    GROUP: null
+    NAME: null
+    TAGS: []
+    MODE: online
+    RESUME: never
+    LOG_MODEL: false
+    LOG_CONFIG: true
+    NOTES: null
+    JOB_TYPE: null
+    ID: null
+    WATCH:
+      ENABLED: true
+      LOG: gradients
+      LOG_FREQ: 250
