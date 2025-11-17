@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 import torch
 import torch.nn as nn
@@ -336,6 +336,107 @@ class _SiglipBlockAdapter(nn.Module):
 
 
 class SigLIP2ViTBackbone(nn.Module):
+    @staticmethod
+    def _parse_layer_indices(spec: Any, total_layers: int) -> List[int]:
+        if spec is None:
+            return []
+        if isinstance(spec, (list, tuple, set)):
+            entries: Sequence[Any] = list(spec)
+        else:
+            entries = [spec]
+        indices: Set[int] = set()
+        for entry in entries:
+            if isinstance(entry, str) and "-" in entry:
+                start_str, end_str = entry.split("-", 1)
+                start = int(start_str.strip())
+                end = int(end_str.strip())
+                if start > end:
+                    start, end = end, start
+                indices.update(range(start, end + 1))
+            else:
+                indices.add(int(entry))
+        return [idx for idx in sorted(indices) if 0 <= idx < total_layers]
+
+    def _build_lora_layer_settings(
+        self,
+        cfg: Dict[str, Any],
+    ) -> tuple[Optional[Dict[int, Dict[str, Dict[str, float]]]], int, bool]:
+        total_layers = self.num_blocks
+
+        def _get(mapping: Dict[str, Any], key: str, fallback: Any) -> Any:
+            return mapping.get(key, mapping.get(key.lower(), fallback))
+
+        include_proj = bool(_get(cfg, "INCLUDE_PROJ", False))
+        base_last_n = int(_get(cfg, "LAST_N_LAYERS", total_layers))
+        per_layer_cfg = cfg.get("PER_LAYER")
+        if not per_layer_cfg:
+            return None, min(total_layers, max(1, base_last_n)), include_proj
+
+        base_attn_rank = int(_get(cfg, "RANK_ATTN", _get(cfg, "RANK", 16)))
+        base_attn_alpha = float(_get(cfg, "ALPHA_ATTN", _get(cfg, "ALPHA_SCALE", 2.0) * base_attn_rank))
+        base_attn_dropout = float(_get(cfg, "ATTN_DROPOUT", _get(cfg, "DROPOUT", 0.0)))
+        base_ffn_rank = int(_get(cfg, "RANK_FFN", _get(cfg, "RANK", 32)))
+        base_ffn_alpha = float(_get(cfg, "ALPHA_FFN", _get(cfg, "ALPHA_SCALE", 2.0) * base_ffn_rank))
+        base_ffn_dropout = float(_get(cfg, "FFN_DROPOUT", _get(cfg, "DROPOUT", 0.0)))
+
+        start_idx = max(0, total_layers - min(total_layers, max(1, base_last_n)))
+
+        def _default_cfg() -> Dict[str, Dict[str, float]]:
+            return {
+                "attn": {
+                    "rank": float(int(base_attn_rank)),
+                    "alpha": base_attn_alpha,
+                    "dropout": base_attn_dropout,
+                },
+                "ffn": {
+                    "rank": float(int(base_ffn_rank)),
+                    "alpha": base_ffn_alpha,
+                    "dropout": base_ffn_dropout,
+                },
+                "include_proj": include_proj,
+            }
+
+        layer_settings: Dict[int, Dict[str, Dict[str, float]]] = {
+            idx: _default_cfg() for idx in range(start_idx, total_layers)
+        }
+
+        if isinstance(per_layer_cfg, dict):
+            segments = [per_layer_cfg]
+        else:
+            segments = list(per_layer_cfg)
+
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            layer_indices = self._parse_layer_indices(segment.get("LAYERS"), total_layers)
+            if not layer_indices:
+                continue
+            include_proj_override = segment.get("INCLUDE_PROJ")
+            attn_override = segment.get("ATTN", {})
+            ffn_override = segment.get("FFN", {})
+
+            for layer_idx in layer_indices:
+                if layer_idx not in layer_settings:
+                    layer_settings[layer_idx] = _default_cfg()
+                if include_proj_override is not None:
+                    layer_settings[layer_idx]["include_proj"] = bool(include_proj_override)
+
+                def _apply_override(target: Dict[str, float], override: Dict[str, Any]) -> None:
+                    if not override:
+                        return
+                    if "RANK" in override or "rank" in override:
+                        target["rank"] = float(_get(override, "RANK", target["rank"]))
+                    if "ALPHA" in override or "alpha" in override:
+                        target["alpha"] = float(_get(override, "ALPHA", target["alpha"]))
+                    if "DROPOUT" in override or "dropout" in override:
+                        target["dropout"] = float(_get(override, "DROPOUT", target["dropout"]))
+
+                _apply_override(layer_settings[layer_idx]["attn"], attn_override)
+                _apply_override(layer_settings[layer_idx]["ffn"], ffn_override)
+
+        min_idx = min(layer_settings.keys()) if layer_settings else total_layers - 1
+        last_n_layers = max(1, total_layers - min_idx)
+        return layer_settings, min(total_layers, last_n_layers), include_proj
     """SigLIP2 ViT backbone emitting raw patch tokens.
 
     The SigLIP2 vision tower ships with a MAP pooling head. This class bypasses
@@ -379,15 +480,18 @@ class SigLIP2ViTBackbone(nn.Module):
 
         self.lora_stats: Optional[LoRAInjectionStats] = None
         if lora_cfg and lora_cfg.get("ENABLED", lora_cfg.get("enabled", False)):
+            layer_settings, last_n_layers, include_proj = self._build_lora_layer_settings(lora_cfg)
             self.lora_stats = inject_lora(
                 self.vision,
-                last_n_layers=int(lora_cfg.get("LAST_N_LAYERS", lora_cfg.get("layers_last_n", 12))),
+                last_n_layers=last_n_layers,
                 r_attn=int(lora_cfg.get("RANK_ATTN", lora_cfg.get("rank_attn", lora_cfg.get("RANK", 16)))),
                 r_ffn=int(lora_cfg.get("RANK_FFN", lora_cfg.get("rank_ffn", lora_cfg.get("RANK", 32)))),
                 alpha_scale=float(lora_cfg.get("ALPHA_SCALE", lora_cfg.get("alpha_scale", 2.0))),
                 dropout=float(lora_cfg.get("DROPOUT", lora_cfg.get("dropout", 0.0))),
                 bias=str(lora_cfg.get("BIAS", lora_cfg.get("bias", "none"))),
-                include_proj=bool(lora_cfg.get("INCLUDE_PROJ", lora_cfg.get("include_proj", False))),
+                include_proj=include_proj,
+                layer_settings=layer_settings,
+                total_layers=self.num_blocks,
             )
 
         drop_path_rates = torch.linspace(0, drop_path, self.vision.config.num_hidden_layers).tolist()

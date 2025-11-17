@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence
 
 import torch
 import yaml
+from lightning import seed_everything
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from lightning.pytorch.loggers.logger import Logger as LightningLoggerBase
@@ -301,11 +302,14 @@ def build_module(
     match_cfg = loss_cfg.get("MATCH", {})
     res_cfg = cfg.get("RESOLUTION", {})
     perfplus_cfg = res_cfg.get("PERFPLUS", {})
+    lora_cfg = cfg.get("MODEL", {}).get("BACKBONE", {}).get("LORA", {})
     stage_cfg = {
         "stage": cfg.get("STAGE", "A"),
         "global_batch_size": int(cfg.get("GLOBAL_BATCH_SIZE", 0)),
         "backbone_freeze": cfg.get("BACKBONE_FREEZE", backbone_frozen),
         "use_lora": cfg.get("USE_LORA", cfg.get("MODEL", {}).get("BACKBONE", {}).get("LORA", {}).get("ENABLED", False)),
+        "use_lora_attn": bool(lora_cfg.get("ENABLED", False)),
+        "use_lora_ffn": bool(lora_cfg.get("ENABLED", False)),
         "resolution_preset": getattr(datamodule, "resolution_preset", "Safe"),
         "eval_interval": int(cfg.get("EVAL", {}).get("INTERVAL_EPOCHS", 1)),
         "seed": cfg.get("SEED", 0),
@@ -314,9 +318,13 @@ def build_module(
         "best_ckpt_name": cfg.get("STAGE_BEST_CKPT", f"{str(cfg.get('STAGE', 'A')).lower()}_best.ckpt"),
         "perfplus_memory_limit_gb": float(perfplus_cfg.get("MEMORY_LIMIT_GB", 23.5)),
         "perfplus_monitor_iters": int(perfplus_cfg.get("MONITOR_ITERS", 50)),
+        "fixed_res": int(data_cfg.get("TRAIN_RES_MAX", 0)),
     }
 
     img_max = int(data_cfg.get("TRAIN_RES_MAX", 1024))
+    total_layers = getattr(backbone, "num_blocks", network.num_blocks)
+    start_block = max(0, total_layers - network.num_blocks)
+    stage_cfg["query_blocks"] = f"{start_block}..{total_layers - 1}"
     module = MaskClassificationPanoptic(
         network=network,
         img_size=(img_max, img_max),
@@ -344,6 +352,8 @@ def build_module(
         stage_other_lr=float(solver_cfg.get("LR_OTHER", solver_cfg.get("LR_HEAD", 5e-4))),
         stage_wd_head=float(solver_cfg.get("WD_HEAD", 0.0)),
         stage_wd_other=float(solver_cfg.get("WD_OTHER", solver_cfg.get("WD", 0.05))),
+        stage_lora_lr=float(solver_cfg.get("LR_LORA", solver_cfg.get("LR_HEAD", 5e-4))),
+        stage_wd_lora=float(solver_cfg.get("WD_LORA", solver_cfg.get("WD_OTHER", solver_cfg.get("WD", 0.05)))),
         stage_betas=tuple(solver_cfg.get("BETAS", (0.9, 0.98))),
         stage_warmup_ratio=float(solver_cfg.get("WARMUP_RATIO", 0.05)),
         distill_feat_weight=float(loss_cfg.get("DISTILL", {}).get("FEAT_ALIGN", 0.0)),
@@ -589,6 +599,10 @@ def build_training_components(
     output_dir = Path(cfg.get("OUTPUT_DIR", "outputs"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    seed = int(cfg.get("SEED", 0))
+    seed_everything(seed, workers=True)
+    LOGGER.info("Global seed set to %d", seed)
+
     datamodule = build_datamodule(cfg)
     steps_per_epoch = len(datamodule.train_dataloader())
     start_steps, end_steps = compute_mask_schedule(cfg, steps_per_epoch)
@@ -612,6 +626,15 @@ def build_training_components(
         summary = backbone.get_lora_summary()
         if summary is not None:
             LOGGER.info("LoRA trainable params: %d", summary.total_trainable)
+            for idx, info in enumerate(summary.per_layer):
+                attn = [name.upper() for name in ("q", "k", "v", "proj") if info.get(name, False)]
+                ffn = [name.upper() for name in ("fc1", "fc2") if info.get(name, False)]
+                LOGGER.info(
+                    "LoRA layer %02d | attention=%s | ffn=%s",
+                    idx,
+                    ",".join(attn) if attn else "-",
+                    ",".join(ffn) if ffn else "-",
+                )
 
     kwargs, resume_path = trainer_kwargs(cfg, output_dir, resume=resume)
     _log_wandb_metadata(cfg, module, datamodule, steps_per_epoch, output_dir, kwargs.get("logger"))

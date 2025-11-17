@@ -394,6 +394,7 @@ class LightningModule(lightning.LightningModule):
                     f"attn_mask_prob_{i}",
                     attn_mask_prob,
                     on_step=True,
+                    sync_dist=True,
                 )
         
         torch.cuda.empty_cache()
@@ -600,12 +601,14 @@ class LightningModule(lightning.LightningModule):
                     self.log(
                         f"metrics/{log_prefix}_iou_class_{class_idx}{block_postfix}",
                         iou,
+                        sync_dist=True,
                     )
 
             iou_all = float(iou_per_class.mean())
             self.log(
                 f"metrics/{log_prefix}_iou_all{block_postfix}",
                 iou_all,
+                sync_dist=True,
             )
 
     def _on_eval_epoch_end_instance(self, log_prefix):
@@ -617,26 +620,32 @@ class LightningModule(lightning.LightningModule):
             self.log(
                 f"metrics/{log_prefix}_ap_all{block_postfix}",
                 results["map"],
+                sync_dist=True,
             )
             self.log(
                 f"metrics/{log_prefix}_ap_small_all{block_postfix}",
                 results["map_small"],
+                sync_dist=True,
             )
             self.log(
                 f"metrics/{log_prefix}_ap_medium_all{block_postfix}",
                 results["map_medium"],
+                sync_dist=True,
             )
             self.log(
                 f"metrics/{log_prefix}_ap_large_all{block_postfix}",
                 results["map_large"],
+                sync_dist=True,
             )
             self.log(
                 f"metrics/{log_prefix}_ap_50_all{block_postfix}",
                 results["map_50"],
+                sync_dist=True,
             )
             self.log(
                 f"metrics/{log_prefix}_ap_75_all{block_postfix}",
                 results["map_75"],
+                sync_dist=True,
             )
 
     def _on_eval_epoch_end_panoptic(self, log_prefix, log_per_class=False):
@@ -680,22 +689,34 @@ class LightningModule(lightning.LightningModule):
                     self.log(
                         f"metrics/{log_prefix}_pq_class_{class_idx}{block_postfix}",
                         pq[class_idx],
+                        sync_dist=True,
                     )
                     self.log(
                         f"metrics/{log_prefix}_sq_class_{class_idx}{block_postfix}",
                         sq[class_idx],
+                        sync_dist=True,
                     )
                     self.log(
                         f"metrics/{log_prefix}_rq_class_{class_idx}{block_postfix}",
                         rq[class_idx],
+                        sync_dist=True,
                     )
 
             self.log(
                 f"metrics/{log_prefix}_pq_all{block_postfix}",
                 pq.mean(),
+                sync_dist=True,
             )
-            self.log(f"metrics/{log_prefix}_sq_all{block_postfix}", sq.mean())
-            self.log(f"metrics/{log_prefix}_rq_all{block_postfix}", rq.mean())
+            self.log(
+                f"metrics/{log_prefix}_sq_all{block_postfix}",
+                sq.mean(),
+                sync_dist=True,
+            )
+            self.log(
+                f"metrics/{log_prefix}_rq_all{block_postfix}",
+                rq.mean(),
+                sync_dist=True,
+            )
 
             num_things = len(metric.things)
             pq_things, sq_things, rq_things = (
@@ -712,26 +733,32 @@ class LightningModule(lightning.LightningModule):
             self.log(
                 f"metrics/{log_prefix}_pq_things{block_postfix}",
                 pq_things.mean(),
+                sync_dist=True,
             )
             self.log(
                 f"metrics/{log_prefix}_sq_things{block_postfix}",
                 sq_things.mean(),
+                sync_dist=True,
             )
             self.log(
                 f"metrics/{log_prefix}_rq_things{block_postfix}",
                 rq_things.mean(),
+                sync_dist=True,
             )
             self.log(
                 f"metrics/{log_prefix}_pq_stuff{block_postfix}",
                 pq_stuff.mean(),
+                sync_dist=True,
             )
             self.log(
                 f"metrics/{log_prefix}_sq_stuff{block_postfix}",
                 sq_stuff.mean(),
+                sync_dist=True,
             )
             self.log(
                 f"metrics/{log_prefix}_rq_stuff{block_postfix}",
                 rq_stuff.mean(),
+                sync_dist=True,
             )
 
     def _on_eval_end_semantic(self, log_prefix):
