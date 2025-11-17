@@ -518,6 +518,31 @@ def trainer_kwargs(
         LearningRateMonitor(logging_interval="epoch"),
         ModelCheckpoint(save_last=True, save_top_k=-1, every_n_epochs=5),
     ]
+
+    # ========== ⭐ 新增：Stage A 专用的 best checkpoint callback ========== 
+    stage_value = cfg.get("STAGE", "")
+    # ⭐ 兼容两种配置格式：
+    # 1. STAGE: "A"（字符串）
+    # 2. STAGE: { STAGE: "A", ... }（字典）
+    if isinstance(stage_value, dict):
+        stage_value = stage_value.get("STAGE", "")
+
+    if str(stage_value).upper() == "A":
+        # 创建专门监控 PQ 的 checkpoint callback
+        best_pq_callback = ModelCheckpoint(
+            dirpath=str(output_dir),           # 保存目录
+            filename="stage_a_best",           # 文件名（不需要 .ckpt 后缀）
+            monitor="metrics/val_pq_all",      # 监控的指标
+            mode="max",                         # 最大化 PQ
+            save_top_k=1,                       # 只保存最佳的1个
+            save_last=False,                    # 不额外保存 last
+            save_on_train_epoch_end=False,     # 只在 validation 后保存
+            auto_insert_metric_name=False,      # 不在文件名中插入指标名
+        )
+        callbacks.append(best_pq_callback)
+        LOGGER.info("Stage A: Added best checkpoint callback monitoring 'metrics/val_pq_all'")
+    # ====================================================================
+
     loggers: List[LightningLoggerBase] = []
     csv_logger = CSVLogger(save_dir=str(output_dir), name="logs")
     loggers.append(csv_logger)
@@ -568,11 +593,20 @@ def build_training_components(
     steps_per_epoch = len(datamodule.train_dataloader())
     start_steps, end_steps = compute_mask_schedule(cfg, steps_per_epoch)
 
-    backbone, _ = build_backbone_from_cfg(cfg)
+    backbone, backbone_frozen = build_backbone_from_cfg(cfg)
     ov_head = build_open_vocab_head(cfg)
     network = build_network(cfg, backbone, ov_head)
     teacher = build_teacher(cfg)
-    module = build_module(cfg, network, datamodule, teacher, start_steps, end_steps)
+    module = build_module(
+            cfg, 
+            network, 
+            datamodule, 
+            teacher, 
+            start_steps, 
+            end_steps,
+            steps_per_epoch,      # ⭐ 添加缺失参数
+            backbone_frozen,      # ⭐ 添加缺失参数
+        )
 
     if hasattr(backbone, "get_lora_summary"):
         summary = backbone.get_lora_summary()

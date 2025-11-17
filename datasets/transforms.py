@@ -15,6 +15,11 @@ from typing import Any, Union
 
 
 class Transforms(nn.Module):
+    def forward(
+        self, img: Tensor, target: dict[str, Union[Tensor, TVTensor]]
+    ) -> tuple[Tensor, dict[str, Union[Tensor, TVTensor]]]:
+        return self._forward_with_retry(img, target, max_retries=10)
+
     def __init__(
         self,
         img_size: tuple[int, int],
@@ -31,6 +36,9 @@ class Transforms(nn.Module):
         flip_prob: float = 0.5,
     ):
         super().__init__()
+        # ⭐ 添加递归计数器
+        self._recursion_depth = 0
+        self._max_recursion = 10
 
         self.img_size = img_size
         self.color_jitter_enabled = color_jitter_enabled
@@ -175,32 +183,99 @@ class Transforms(nn.Module):
             return img, target
 
         return img, target
-
-    def forward(
-        self, img: Tensor, target: dict[str, Union[Tensor, TVTensor]]
+        
+    def _forward_with_retry(
+        self, 
+        img: Tensor, 
+        target: dict[str, Union[Tensor, TVTensor]],
+        max_retries: int = 10
     ) -> tuple[Tensor, dict[str, Union[Tensor, TVTensor]]]:
-        img_orig, target_orig = img, target
-
-        target = self._filter(target, ~target["is_crowd"])
-
-        img = self.color_jitter(img)
-        img, target = self.random_horizontal_flip(img, target)
-        img, target = self._resize_short_edge(img, target)
-        img, target = self._safe_random_square_crop(img, target)
-        img, target = self.pad(img, target)
-        if img.shape[-2:] != self.img_size:
-            img = F.resize(img, self.img_size, interpolation=F.InterpolationMode.BILINEAR)
-            target["masks"] = F.resize(
-                target["masks"], self.img_size, interpolation=F.InterpolationMode.NEAREST
+        """前向传播，带有重试机制防止无限递归"""
+        
+        for retry_count in range(max_retries):
+            # 深拷贝以避免循环引用
+            img_input = img.clone()
+            target_input = {
+                k: (v.clone() if isinstance(v, (Tensor, TVTensor)) else v)
+                for k, v in target.items()
+            }
+            
+            target_filtered = self._filter(target_input, ~target_input["is_crowd"])
+            
+            img_transformed = self.color_jitter(img_input)
+            img_transformed, target_filtered = self.random_horizontal_flip(img_transformed, target_filtered)
+            img_transformed, target_filtered = self._resize_short_edge(img_transformed, target_filtered)
+            img_transformed, target_filtered = self._safe_random_square_crop(img_transformed, target_filtered)
+            img_transformed, target_filtered = self.pad(img_transformed, target_filtered)
+            
+            if img_transformed.shape[-2:] != self.img_size:
+                img_transformed = F.resize(img_transformed, self.img_size, interpolation=F.InterpolationMode.BILINEAR)
+                target_filtered["masks"] = F.resize(
+                    target_filtered["masks"], self.img_size, interpolation=F.InterpolationMode.NEAREST
+                )
+            
+            valid = target_filtered["masks"].flatten(1).any(1)
+            if valid.any():
+                # 成功：至少有一个有效mask
+                target_out = self._filter(target_filtered, valid)
+                return img_transformed, target_out
+        
+        # 重试次数用完，强制返回正确尺寸的结果
+        import warnings
+        warnings.warn(f"Failed to get valid masks after {max_retries} retries, forcing resize to {self.img_size}")
+        
+        # ⭐ 强制将图像和masks调整到目标尺寸
+        img_fallback = img.clone()
+        target_fallback = {
+            k: (v.clone() if isinstance(v, (Tensor, TVTensor)) else v)
+            for k, v in target.items()
+        }
+        
+        # 过滤 crowd
+        target_fallback = self._filter(target_fallback, ~target_fallback["is_crowd"])
+        
+        # ⭐ 关键：先 pad，再 resize（与主流程一致）
+        img_fallback, target_fallback = self.pad(img_fallback, target_fallback)
+        
+        # 强制 resize 到目标尺寸
+        if img_fallback.shape[-2:] != self.img_size:
+            img_fallback = F.resize(img_fallback, self.img_size, interpolation=F.InterpolationMode.BILINEAR)
+            target_fallback["masks"] = F.resize(
+                target_fallback["masks"], self.img_size, interpolation=F.InterpolationMode.NEAREST
             )
+        
+        # 确保有有效masks，如果没有就返回全部
+        valid = target_fallback["masks"].flatten(1).any(1)
+        if valid.any():
+            target_fallback = self._filter(target_fallback, valid)
+        
+        return img_fallback, target_fallback
 
-        valid = target["masks"].flatten(1).any(1)
-        if not valid.any():
-            return self(img_orig, target_orig)
+    # def forward(
+    #     self, img: Tensor, target: dict[str, Union[Tensor, TVTensor]]
+    # ) -> tuple[Tensor, dict[str, Union[Tensor, TVTensor]]]:
+    #     img_orig, target_orig = img, target
 
-        target = self._filter(target, valid)
+    #     target = self._filter(target, ~target["is_crowd"])
 
-        return img, target
+    #     img = self.color_jitter(img)
+    #     img, target = self.random_horizontal_flip(img, target)
+    #     img, target = self._resize_short_edge(img, target)
+    #     img, target = self._safe_random_square_crop(img, target)
+    #     img, target = self.pad(img, target)
+    #     if img.shape[-2:] != self.img_size:
+    #         img = F.resize(img, self.img_size, interpolation=F.InterpolationMode.BILINEAR)
+    #         target["masks"] = F.resize(
+    #             target["masks"], self.img_size, interpolation=F.InterpolationMode.NEAREST
+    #         )
+
+    #     valid = target["masks"].flatten(1).any(1)
+    #     if not valid.any():
+    #         return self(img_orig, target_orig)
+
+    #     target = self._filter(target, valid)
+
+    #     return img, target
 
 class MinimalTransforms(nn.Module):
     """

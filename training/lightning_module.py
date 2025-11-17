@@ -8,6 +8,7 @@
 # All used under the Apache 2.0 License.
 # ---------------------------------------------------------------
 
+import logging
 import math
 from typing import Optional, cast
 import lightning
@@ -36,6 +37,8 @@ import cv2
 
 from training.two_stage_warmup_poly_schedule import TwoStageWarmupPolySchedule
 from engine.distill import compute_feat_align, compute_itc
+
+LOGGER = logging.getLogger(__name__)
 
 bold_green = "\033[1;32m"
 reset = "\033[0m"
@@ -273,7 +276,7 @@ class LightningModule(lightning.LightningModule):
                 prog_bar=False,
                 sync_dist=True,
             )
-            if no_object_ratio > 0.6 and self.trainer.is_global_zero:
+            if no_object_ratio > 0.9 and self.trainer.is_global_zero:
                 rank_zero_info(
                     "High no-object ratio detected (%.3f). Consider adjusting thresholds.",
                     float(no_object_ratio),
@@ -479,6 +482,11 @@ class LightningModule(lightning.LightningModule):
     ):
         for i in range(len(preds)):
             metric = self.metrics[block_idx]
+            # ⭐ 将数据移到 CPU（与 metric 在同一设备）
+            # pred_cpu = preds[i].cpu()
+            # target_cpu = targets[i].cpu()
+            # is_crowd_cpu = is_crowds[i].cpu()
+
             flatten_pred = _prepocess_inputs(
                 metric.things,
                 metric.stuffs,
@@ -632,6 +640,9 @@ class LightningModule(lightning.LightningModule):
             )
 
     def _on_eval_epoch_end_panoptic(self, log_prefix, log_per_class=False):
+        # ⭐ 在计算 metrics 前清理 GPU 缓存
+        torch.cuda.empty_cache()
+
         for i, metric in enumerate(self.metrics):  # type: ignore
             # ==================== DDP 死锁修复 ====================
             # 检查 metric 是否有数据更新（避免空 GPU 死锁）
@@ -641,8 +652,18 @@ class LightningModule(lightning.LightningModule):
                     LOGGER.warning(f"⚠️ Metric {i} has no examples, skipping compute")
                     continue
                 
-                # 尝试 compute，如果失败则跳过
-                result = metric.compute()[:-1]
+                # ⭐ 尝试在 GPU 上 compute，如果 OOM 则移到 CPU
+                try:
+                    result = metric.compute()[:-1]
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        LOGGER.warning(f"⚠️ GPU OOM when computing metric {i}, moving to CPU")
+                        torch.cuda.empty_cache()
+                        metric_cpu = metric.cpu()
+                        result = metric_cpu.compute()[:-1]
+                        metric_cpu.to(self.device)  # 移回 GPU
+                    else:
+                        raise
             except Exception as e:
                 LOGGER.warning(f"⚠️ Failed to compute metric {i}: {e}")
                 metric.reset()
@@ -1098,7 +1119,7 @@ class LightningModule(lightning.LightningModule):
         
         # 1. 显示原始图像
         axes[0].imshow(img.cpu().numpy().transpose(1, 2, 0))
-        axes[0].set_title("原始图像", fontsize=14)
+        axes[0].set_title("Original Image", fontsize=14)
         axes[0].axis("off")
         
         # 2. 生成GT panoptic分割图
@@ -1112,7 +1133,7 @@ class LightningModule(lightning.LightningModule):
             mask_logits, class_logits, img.shape[-2:]
         )
         axes[2].imshow(pred_panoptic)
-        axes[2].set_title("预测结果", fontsize=14)
+        axes[2].set_title("Prediction", fontsize=14)
         axes[2].axis("off")
         
         # 保存并上传到wandb

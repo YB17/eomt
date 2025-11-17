@@ -177,8 +177,8 @@ class DirectoryDataset(torch.utils.data.Dataset):
                         continue
             else:
                 if not only_annotations_json:
-                if not target_file_path.exists():
-                    continue
+                    if not target_file_path.exists():
+                        continue
 
                 if check_empty_targets:
                     min_val, max_val = Image.open(target_file_path).getextrema()

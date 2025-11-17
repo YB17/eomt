@@ -1,5 +1,5 @@
 STAGE: "A"
-EPOCHS: 5
+EPOCHS: 3
 GLOBAL_BATCH_SIZE: 32
 BACKBONE_FREEZE: true
 USE_LORA: false
@@ -7,15 +7,15 @@ SEED: 3407
 RESOLUTION:
   PRESET: "Safe"
   SAFE:
-    SHORT_EDGE: [448, 576]
-    LONG_EDGE_MAX: 576
-    CROP_SIZES: [512, 576]
+    SHORT_EDGE: [512, 512]      # ⭐ 固定 512
+    LONG_EDGE_MAX: 512
+    CROP_SIZES: [512]           # ⭐ 只用 512
     COLOR_JITTER: true
     FLIP_PROB: 0.5
   PERFPLUS:
-    SHORT_EDGE: [560, 704]
-    LONG_EDGE_MAX: 704
-    CROP_SIZES: [640, 672]
+    SHORT_EDGE: [512, 512]      # ⭐ 固定 512
+    LONG_EDGE_MAX: 512
+    CROP_SIZES: [512]           # ⭐ 只用 512
     COLOR_JITTER: true
     FLIP_PROB: 0.5
     AMP: true
@@ -28,8 +28,8 @@ DATA:
   ROOT: "/home/host/coco"
   TRAIN_SPLIT: train2017
   VAL_SPLIT: val2017
-  TRAIN_RES_MAX: 576
-  BATCH_SIZE: 4
+  TRAIN_RES_MAX: 512
+  BATCH_SIZE: 10
   NUM_WORKERS: 8
   PIN_MEMORY: true
   PERSISTENT_WORKERS: true
@@ -37,13 +37,13 @@ DATA:
   OPEN_VOCAB_SPLIT: "ovp_val"
 SOLVER:
   OPTIM: AdamW
-  LR_HEAD: 5.0e-4
-  LR_OTHER: 3.0e-4
+  LR_HEAD: 1.25e-3
+  LR_OTHER: 7.5e-4
   WD_HEAD: 0.0
   WD_OTHER: 0.05
   BETAS: [0.9, 0.98]
   CLIP_GRAD: 1.0
-  EPOCHS: 5
+  EPOCHS: 3
   WARMUP_RATIO: 0.05
   LR_SCHEDULE: "cosine"
 LOSS:
@@ -68,7 +68,7 @@ MODEL:
     NAME: ViT-B-16-SigLIP2-512
     MODEL_ID: "/home/host/siglip2/"
     DROP_PATH: 0.1
-    NAFLEX: true
+    NAFLEX: false
     FREEZE: true
     FP16: true
     LORA:

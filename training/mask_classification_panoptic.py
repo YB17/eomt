@@ -397,6 +397,9 @@ class MaskClassificationPanoptic(LightningModule):
         for i, (mask_logits, class_logits) in enumerate(
             list(zip(mask_logits_per_layer, class_logits_per_layer))
         ):
+            # ⭐ 只评估最后一个block（训练时中间的blocks是辅助损失，验证时不需要）
+            if i != len(mask_logits_per_layer) - 1:
+                continue
             mask_logits = F.interpolate(mask_logits, self.img_size, mode="bilinear")
             mask_logits = self.revert_resize_and_pad_logits_instance_panoptic(
                 mask_logits, img_sizes
@@ -414,7 +417,7 @@ class MaskClassificationPanoptic(LightningModule):
             )
             self.update_metrics_panoptic(preds, targets, is_crowds, i)
         if (
-            batch_idx % 5 == 0
+            False #batch_idx < 1 #batch_idx % 5 == 0
             and self.trainer.is_global_zero
             and not getattr(self, "_calibration_mode", False)
         ):  # 每5个batch可视化一次，或者完全禁用
@@ -429,7 +432,7 @@ class MaskClassificationPanoptic(LightningModule):
             )
     def on_validation_epoch_end(self):
         self._on_eval_epoch_end_panoptic("val")
-        self._maybe_save_stage_a_best_ckpt()
+        # self._maybe_save_stage_a_best_ckpt()
 
     def on_validation_end(self):
         self._on_eval_end_panoptic("val")
