@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -107,7 +107,7 @@ def _replace_linear(
     parent: nn.Module,
     name: str,
     rank: int,
-    alpha_scale: float,
+    alpha: float,
     dropout: float,
     bias: str,
 ) -> bool:
@@ -118,7 +118,7 @@ def _replace_linear(
         return True
     if not isinstance(layer, nn.Linear):
         return False
-    alpha = alpha_scale * float(rank)
+    alpha = float(alpha)
     lora_layer = LoRALinear(layer, rank=rank, alpha=alpha, dropout=dropout, bias=bias)
     setattr(parent, name, lora_layer)
     return True
@@ -133,6 +133,8 @@ def inject_lora(
     dropout: float = 0.05,
     bias: str = "none",
     include_proj: bool = False,
+    layer_settings: Optional[Dict[int, Dict[str, Dict[str, float]]]] = None,
+    total_layers: Optional[int] = None,
 ) -> LoRAInjectionStats:
     """Inject LoRA adapters into the last ``n`` Transformer blocks.
 
@@ -160,8 +162,30 @@ def inject_lora(
     if not blocks:
         raise ValueError("No transformer blocks found for LoRA injection")
 
+    if total_layers is not None and total_layers != len(blocks):
+        raise ValueError(
+            f"LoRA total_layers={total_layers} does not match backbone depth={len(blocks)}"
+        )
+
     start_idx = max(0, len(blocks) - last_n_layers)
     coverage: List[Dict[str, bool]] = []
+
+    if layer_settings is None:
+        layer_settings = {}
+        for idx in range(start_idx, len(blocks)):
+            layer_settings[idx] = {
+                "attn": {
+                    "rank": r_attn,
+                    "alpha": alpha_scale * float(r_attn),
+                    "dropout": dropout,
+                },
+                "ffn": {
+                    "rank": r_ffn,
+                    "alpha": alpha_scale * float(r_ffn),
+                    "dropout": dropout,
+                },
+                "include_proj": include_proj,
+            }
 
     for idx, block in enumerate(blocks):
         info: Dict[str, bool] = {
@@ -176,22 +200,82 @@ def inject_lora(
             coverage.append(info)
             continue
 
+        layer_cfg = layer_settings.get(idx)
+        if layer_cfg is None:
+            coverage.append(info)
+            continue
+
         attn = getattr(block, "self_attn", getattr(block, "attn", None))
         if attn is None:
             raise AttributeError(f"Block {idx} has no attention module")
-        info["q"] = _replace_linear(attn, "q_proj", r_attn, alpha_scale, dropout, bias)
-        info["k"] = _replace_linear(attn, "k_proj", r_attn, alpha_scale, dropout, bias)
-        info["v"] = _replace_linear(attn, "v_proj", r_attn, alpha_scale, dropout, bias)
-        if include_proj:
-            info["proj"] = _replace_linear(attn, "out_proj", r_attn, alpha_scale, dropout, bias)
+        attn_cfg = layer_cfg.get("attn")
+        ffn_cfg = layer_cfg.get("ffn")
+        include_proj_layer = bool(layer_cfg.get("include_proj", include_proj))
+
+        if attn_cfg is None or ffn_cfg is None:
+            raise RuntimeError(f"Layer {idx} missing attn/ffn LoRA configuration")
+
+        info["q"] = _replace_linear(
+            attn,
+            "q_proj",
+            int(attn_cfg.get("rank", r_attn)),
+            float(attn_cfg.get("alpha", alpha_scale * r_attn)),
+            float(attn_cfg.get("dropout", dropout)),
+            bias,
+        )
+        info["k"] = _replace_linear(
+            attn,
+            "k_proj",
+            int(attn_cfg.get("rank", r_attn)),
+            float(attn_cfg.get("alpha", alpha_scale * r_attn)),
+            float(attn_cfg.get("dropout", dropout)),
+            bias,
+        )
+        info["v"] = _replace_linear(
+            attn,
+            "v_proj",
+            int(attn_cfg.get("rank", r_attn)),
+            float(attn_cfg.get("alpha", alpha_scale * r_attn)),
+            float(attn_cfg.get("dropout", dropout)),
+            bias,
+        )
+        if include_proj_layer:
+            info["proj"] = _replace_linear(
+                attn,
+                "out_proj",
+                int(attn_cfg.get("rank", r_attn)),
+                float(attn_cfg.get("alpha", alpha_scale * r_attn)),
+                float(attn_cfg.get("dropout", dropout)),
+                bias,
+            )
+        elif include_proj:
+            info["proj"] = False
 
         mlp = getattr(block, "mlp", None)
         if mlp is None:
             raise AttributeError(f"Block {idx} has no MLP module")
-        info["fc1"] = _replace_linear(mlp, "fc1", r_ffn, alpha_scale, dropout, bias)
-        info["fc2"] = _replace_linear(mlp, "fc2", r_ffn, alpha_scale, dropout, bias)
+        info["fc1"] = _replace_linear(
+            mlp,
+            "fc1",
+            int(ffn_cfg.get("rank", r_ffn)),
+            float(ffn_cfg.get("alpha", alpha_scale * r_ffn)),
+            float(ffn_cfg.get("dropout", dropout)),
+            bias,
+        )
+        info["fc2"] = _replace_linear(
+            mlp,
+            "fc2",
+            int(ffn_cfg.get("rank", r_ffn)),
+            float(ffn_cfg.get("alpha", alpha_scale * r_ffn)),
+            float(ffn_cfg.get("dropout", dropout)),
+            bias,
+        )
         if not info["fc1"] or not info["fc2"]:
             raise RuntimeError("LoRA must cover both fc1 and fc2 in each block")
+        if not (info["q"] and info["k"] and info["v"]):
+            raise RuntimeError(f"LoRA attention coverage incomplete for block {idx}")
+        if include_proj_layer and not info["proj"]:
+            raise RuntimeError(f"LoRA attention proj missing for block {idx}")
 
         coverage.append(info)
 

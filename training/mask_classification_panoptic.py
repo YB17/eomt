@@ -56,6 +56,8 @@ class MaskClassificationPanoptic(LightningModule):
         stage_other_lr: Optional[float] = None,
         stage_wd_head: float = 0.0,
         stage_wd_other: float = 0.05,
+        stage_lora_lr: Optional[float] = None,
+        stage_wd_lora: float = 0.05,
         stage_betas: Optional[tuple[float, float]] = None,
         stage_warmup_ratio: float = 0.05,
         distill_feat_weight: float = 0.0,
@@ -98,12 +100,15 @@ class MaskClassificationPanoptic(LightningModule):
         self.stage_total_epochs = int(self.stage_config.get("epochs", 1))
         self.stage_head_lr = stage_head_lr or lr
         self.stage_other_lr = stage_other_lr or lr
+        self.stage_lora_lr = stage_lora_lr or self.lr_lora
         self.stage_wd_head = stage_wd_head
         self.stage_wd_other = stage_wd_other
+        self.stage_wd_lora = stage_wd_lora
         self.stage_betas = stage_betas or (0.9, 0.98)
         self.stage_warmup_ratio = stage_warmup_ratio
         self.stage_total_steps = None
         self.stage_is_a = str(self.stage_config.get("stage", "")).upper() == "A"
+        self.stage_is_b = str(self.stage_config.get("stage", "")).upper() == "B"
         self._latest_attn_probs: List[float] = []
         self._stage_best_ckpt_path: Optional[Path] = None
         self._stage_best_metric: Optional[float] = None
@@ -112,6 +117,7 @@ class MaskClassificationPanoptic(LightningModule):
         self._perfplus_monitor_iters = int(self.stage_config.get("perfplus_monitor_iters", 50))
         self._perfplus_memory_limit_gb = float(self.stage_config.get("perfplus_memory_limit_gb", 23.5))
         self._calibration_mode = False
+        self._saved_eval_attn_probs: Optional[torch.Tensor] = None
 
         self.criterion = MaskClassificationLoss(
             num_points=num_points,
@@ -184,6 +190,49 @@ class MaskClassificationPanoptic(LightningModule):
             lora_params,
         )
 
+    @staticmethod
+    def _is_head_param(name: str) -> bool:
+        return name.startswith("network.mask_head") or name.startswith("network.class_head") or name.startswith("network.open_vocab_head")
+
+    def _stage_b_param_split(self):
+        heads, norm_bias, others, lora = [], [], [], []
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if getattr(param, "_is_lora_param", False):
+                lora.append((name, param))
+                continue
+            if self._is_head_param(name):
+                heads.append((name, param))
+                continue
+            if name.endswith(".bias") or name.split(".")[-1] == "bias" or "norm" in name.lower():
+                norm_bias.append((name, param))
+                continue
+            others.append((name, param))
+        return heads, norm_bias, others, lora
+
+    def _log_stage_b_param_stats(self, heads, norm_bias, others, lora):
+        counts = [
+            ("heads", sum(p.numel() for _, p in heads)),
+            ("norm_bias", sum(p.numel() for _, p in norm_bias)),
+            ("others", sum(p.numel() for _, p in others)),
+            ("lora", sum(p.numel() for _, p in lora)),
+        ]
+        total = sum(value for _, value in counts)
+        if total == 0:
+            return
+        rank_zero_info(
+            "StageB param split | heads=%d (%.2f%%) norm_bias=%d (%.2f%%) others=%d (%.2f%%) lora=%d (%.2f%%)",
+            counts[0][1],
+            100.0 * counts[0][1] / total,
+            counts[1][1],
+            100.0 * counts[1][1] / total,
+            counts[2][1],
+            100.0 * counts[2][1] / total,
+            counts[3][1],
+            100.0 * counts[3][1] / total,
+        )
+
     def _configure_stage_a_optim(self):
         heads, others, lora = self._stage_a_param_split()
         if lora:
@@ -223,9 +272,86 @@ class MaskClassificationPanoptic(LightningModule):
             "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
         }
 
+    def _assert_stage_b_backbone_freeze(self) -> None:
+        trainable_backbone = [
+            name
+            for name, param in self.named_parameters()
+            if param.requires_grad
+            and name.startswith("network.encoder.backbone")
+            and not getattr(param, "_is_lora_param", False)
+        ]
+        if trainable_backbone:
+            raise RuntimeError(
+                "Stage B requires frozen backbone weights aside from LoRA adapters. Found: %s"
+                % trainable_backbone[:5]
+            )
+
+    def _configure_stage_b_optim(self):
+        heads, norm_bias, others, lora = self._stage_b_param_split()
+        self._assert_stage_b_backbone_freeze()
+        if not lora:
+            raise RuntimeError("Stage B expects trainable LoRA parameters")
+        self._log_stage_b_param_stats(heads, norm_bias, others, lora)
+
+        optim_groups = []
+        combined_no_wd = heads + norm_bias
+        if combined_no_wd:
+            optim_groups.append(
+                {
+                    "params": [p for _, p in combined_no_wd],
+                    "lr": self.stage_head_lr,
+                    "weight_decay": self.stage_wd_head,
+                }
+            )
+        if others:
+            optim_groups.append(
+                {
+                    "params": [p for _, p in others],
+                    "lr": self.stage_other_lr,
+                    "weight_decay": self.stage_wd_other,
+                }
+            )
+        optim_groups.append(
+            {
+                "params": [p for _, p in lora],
+                "lr": self.stage_lora_lr,
+                "weight_decay": self.stage_wd_lora,
+            }
+        )
+
+        rank_zero_info(
+            "StageB optim groups | heads+norm lr=%.2e wd=%.3f | others lr=%.2e wd=%.3f | lora lr=%.2e wd=%.3f",
+            self.stage_head_lr,
+            self.stage_wd_head,
+            self.stage_other_lr,
+            self.stage_wd_other,
+            self.stage_lora_lr,
+            self.stage_wd_lora,
+        )
+
+        optimizer = AdamW(optim_groups, betas=self.stage_betas)
+        total_steps = self._compute_stage_total_steps()
+        warmup_steps = max(1, int(total_steps * self.stage_warmup_ratio))
+        rank_zero_info("StageB scheduler: warmup_steps=%d total_steps=%d", warmup_steps, total_steps)
+
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return float(step + 1) / warmup_steps
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            progress = min(1.0, max(0.0, progress))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
+        }
+
     def configure_optimizers(self):
         if self.stage_is_a:
             return self._configure_stage_a_optim()
+        if self.stage_is_b:
+            return self._configure_stage_b_optim()
         return super().configure_optimizers()
 
     def _assert_stage_a_freeze(self) -> None:
@@ -248,23 +374,28 @@ class MaskClassificationPanoptic(LightningModule):
 
     def on_fit_start(self) -> None:
         super().on_fit_start()
+        stage_label = str(self.stage_config.get("stage", "")).upper()
+        rank_zero_info(
+            "Stage=%s; backbone_freeze=%s; use_lora=%s; use_lora_attn=%s; use_lora_ffn=%s; query_blocks=%s; fixed_res=%s; epochs=%s; global_bs=%s",
+            stage_label,
+            self.stage_config.get("backbone_freeze"),
+            self.stage_config.get("use_lora"),
+            self.stage_config.get("use_lora_attn"),
+            self.stage_config.get("use_lora_ffn"),
+            self.stage_config.get("query_blocks"),
+            self.stage_config.get("fixed_res"),
+            self.stage_config.get("epochs"),
+            self.stage_config.get("global_batch_size"),
+        )
+        rank_zero_info(
+            "Preset=%s seed=%s",
+            self.stage_config.get("resolution_preset"),
+            self.stage_config.get("seed"),
+        )
         if self.stage_is_a:
             self.stage_total_epochs = int(self.stage_config.get("epochs", self.trainer.max_epochs))
             self.stage_total_steps = None
             self._assert_stage_a_freeze()
-            rank_zero_info(
-                "Stage=%s; backbone_freeze=%s; use_lora=%s; epochs=%s; global_bs=%s",
-                self.stage_config.get("stage"),
-                self.stage_config.get("backbone_freeze"),
-                self.stage_config.get("use_lora"),
-                self.stage_total_epochs,
-                self.stage_config.get("global_batch_size"),
-            )
-            rank_zero_info(
-                "StageA preset=%s seed=%s",
-                self.stage_config.get("resolution_preset"),
-                self.stage_config.get("seed"),
-            )
             if (
                 torch.cuda.is_available()
                 and str(self.stage_config.get("resolution_preset", "")).lower() == "perfplus"
@@ -282,6 +413,17 @@ class MaskClassificationPanoptic(LightningModule):
         value = max(0.5, float(value))
         self.network.attn_mask_probs.fill_(value)
         self._latest_attn_probs = [float(value)] * len(self.network.attn_mask_probs)
+
+    def _update_stage_b_attn_probs(self) -> None:
+        if not self.network.masked_attn_enabled:
+            return
+        total_steps = self._compute_stage_total_steps()
+        if total_steps <= 0:
+            return
+        progress = min(1.0, max(0.0, self.global_step / float(total_steps)))
+        value = max(0.0, float((1.0 - progress) ** 0.9))
+        self.network.attn_mask_probs.fill_(value)
+        self._latest_attn_probs = [value] * len(self.network.attn_mask_probs)
 
     def _monitor_perfplus_memory(self) -> None:
         if self._perfplus_fallback_done:
@@ -318,8 +460,8 @@ class MaskClassificationPanoptic(LightningModule):
         self._stage_best_ckpt_path = path
         return path
 
-    def _maybe_save_stage_a_best_ckpt(self) -> None:
-        if not self.stage_is_a or self.trainer is None:
+    def _maybe_save_stage_best_ckpt(self) -> None:
+        if self.trainer is None:
             return
         pq_all = self.trainer.callback_metrics.get("metrics/val_pq_all")
         if pq_all is None:
@@ -334,9 +476,14 @@ class MaskClassificationPanoptic(LightningModule):
         if self.trainer.is_global_zero:
             ckpt_path.parent.mkdir(parents=True, exist_ok=True)
             self.trainer.save_checkpoint(str(ckpt_path))
-            rank_zero_info("StageA best PQ_all=%.3f saved to %s", pq_value, ckpt_path)
+            rank_zero_info(
+                "Stage%s best PQ_all=%.3f saved to %s",
+                str(self.stage_config.get("stage", "")).upper(),
+                pq_value,
+                ckpt_path,
+            )
         if self.trainer.strategy is not None:
-            self.trainer.strategy.barrier("stage_a_best_ckpt")
+            self.trainer.strategy.barrier("stage_best_ckpt")
 
     def on_train_batch_end(self, outputs, batch, batch_idx=None, dataloader_idx=None):
         if self.stage_is_a:
@@ -353,12 +500,25 @@ class MaskClassificationPanoptic(LightningModule):
             import gc
 
             gc.collect()
+        elif self.stage_is_b:
+            self._update_stage_b_attn_probs()
+            for i, attn_mask_prob in enumerate(self.network.attn_mask_probs):
+                self.log(
+                    f"attn_mask_prob_{i}",
+                    attn_mask_prob,
+                    on_step=True,
+                    sync_dist=True,
+                )
+            torch.cuda.empty_cache()
+            import gc
+
+            gc.collect()
         else:
             super().on_train_batch_end(outputs, batch, batch_idx=batch_idx, dataloader_idx=dataloader_idx)
 
     def on_train_epoch_end(self):
         super().on_train_epoch_end()
-        if self.stage_is_a and self._latest_attn_probs:
+        if self._latest_attn_probs:
             for i, prob in enumerate(self._latest_attn_probs):
                 self.log(
                     f"attn_mask_prob_epoch_{i}",
@@ -367,12 +527,19 @@ class MaskClassificationPanoptic(LightningModule):
                     sync_dist=True,
                 )
             rank_zero_info(
-                "Epoch %d attn_mask_probs=%s",
+                "Epoch %d stage=%s attn_mask_probs=%s",
                 self.current_epoch,
+                str(self.stage_config.get("stage", "")).upper(),
                 [f"{p:.3f}" for p in self._latest_attn_probs],
             )
 
     # ------------------------------------------------------------------
+
+    def on_validation_epoch_start(self):
+        super().on_validation_epoch_start()
+        if self.stage_is_b and hasattr(self.network, "attn_mask_probs"):
+            self._saved_eval_attn_probs = self.network.attn_mask_probs.detach().clone()
+            self.network.attn_mask_probs.zero_()
 
     def eval_step(
         self,
@@ -432,20 +599,24 @@ class MaskClassificationPanoptic(LightningModule):
             )
     def on_validation_epoch_end(self):
         self._on_eval_epoch_end_panoptic("val")
-        # self._maybe_save_stage_a_best_ckpt()
+        self._maybe_save_stage_best_ckpt()
+        if self.stage_is_b and self._saved_eval_attn_probs is not None:
+            self.network.attn_mask_probs.data.copy_(self._saved_eval_attn_probs)
+            self._saved_eval_attn_probs = None
 
     def on_validation_end(self):
         self._on_eval_end_panoptic("val")
 
     def on_fit_end(self) -> None:
         super().on_fit_end()
+        if self._stage_best_metric is not None:
+            rank_zero_info(
+                "Stage%s final best PQ_all=%.3f @ %s",
+                str(self.stage_config.get("stage", "")).upper(),
+                self._stage_best_metric,
+                self._resolve_stage_best_ckpt_path(),
+            )
         if self.stage_is_a:
-            if self._stage_best_metric is not None:
-                rank_zero_info(
-                    "StageA final best PQ_all=%.3f @ %s",
-                    self._stage_best_metric,
-                    self._resolve_stage_best_ckpt_path(),
-                )
             self._run_stage_a_calibration()
 
     # ------------------------------------------------------------------
