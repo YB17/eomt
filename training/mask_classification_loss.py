@@ -10,6 +10,7 @@
 
 
 from typing import Dict, List, Optional
+import logging
 import torch.distributed as dist
 import torch
 import torch.nn as nn
@@ -69,6 +70,28 @@ class MaskClassificationLoss(Mask2FormerLoss):
                 cost_class=class_coefficient,
             )
 
+        self._logger = logging.getLogger(__name__)
+
+    def _sanitize_labels(self, labels: torch.Tensor, batch_idx: int) -> torch.Tensor:
+        """确保标签位于[0, num_labels)范围内，防止CUDA索引越界。"""
+        if labels.numel() == 0 or self.num_labels <= 0:
+            return labels
+
+        invalid = (labels < 0) | (labels >= self.num_labels)
+        if not invalid.any():
+            return labels
+
+        invalid_vals = labels[invalid].tolist()
+        self._logger.error(
+            "Clamping %d invalid class labels %s in batch %d (valid range: [0, %d)).",
+            len(invalid_vals),
+            invalid_vals,
+            batch_idx,
+            self.num_labels,
+        )
+
+        return labels.clamp(0, self.num_labels - 1)
+
     @torch.compiler.disable
     def forward(
         self,
@@ -80,7 +103,12 @@ class MaskClassificationLoss(Mask2FormerLoss):
         seen_mask: Optional[List[torch.Tensor]] = None,
     ):
         mask_labels = [target["masks"].to(masks_queries_logits.dtype) for target in targets]
-        class_labels = [target["labels"].long() for target in targets]
+        class_labels: List[torch.Tensor] = []
+        for batch_idx, target in enumerate(targets):
+            labels = target["labels"].long()
+            labels = self._sanitize_labels(labels, batch_idx)
+            target["labels"] = labels
+            class_labels.append(labels)
         # 只用is_thing作为标签，thing=1, stuff=0
         # class_labels = [target["is_thing"].long() for target in targets]
 
