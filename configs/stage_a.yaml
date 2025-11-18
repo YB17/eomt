@@ -1,52 +1,57 @@
-STAGE: "B"
-EPOCHS: 25
-GLOBAL_BATCH_SIZE: 48
+STAGE: "A"
+EPOCHS: 3
+GLOBAL_BATCH_SIZE: 80
 BACKBONE_FREEZE: true
-USE_LORA: true
+USE_LORA: false
 SEED: 3407
-RESUME_FROM_STAGE_A: "/home/dockeruser/ybai_ws/eomt/runs/coco_eomt_siglip2_ov/stageA/logs/version_32/checkpoints/last.ckpt"
+
+ANNEAL:
+  ENABLED: true
+  L2_BLOCKS: 4      # decoder blocks 的数量
+  FACTOR: 0.9       # annealing 的 power 因子
 
 RESOLUTION:
   PRESET: "Safe"
   SAFE:
-    SHORT_EDGE: [512, 512]
+    SHORT_EDGE: [512, 512]      # ⭐ 固定 512
     LONG_EDGE_MAX: 512
-    CROP_SIZES: [512]
+    CROP_SIZES: [512]           # ⭐ 只用 512
     COLOR_JITTER: true
     FLIP_PROB: 0.5
-
+  PERFPLUS:
+    SHORT_EDGE: [512, 512]      # ⭐ 固定 512
+    LONG_EDGE_MAX: 512
+    CROP_SIZES: [512]           # ⭐ 只用 512
+    COLOR_JITTER: true
+    FLIP_PROB: 0.5
+    AMP: true
+    SDPA: true
+    FLASH_ATTN: true
+    GRADIENT_CHECKPOINT: true
+    GRAD_ACCUM: 2
 DATA:
   DATASET: coco_panoptic
   ROOT: "/home/host/coco"
   TRAIN_SPLIT: train2017
   VAL_SPLIT: val2017
   TRAIN_RES_MAX: 512
-  BATCH_SIZE: 6
+  BATCH_SIZE: 10
   NUM_WORKERS: 8
   PIN_MEMORY: true
   PERSISTENT_WORKERS: true
   CHECK_EMPTY_TARGETS: true
   OPEN_VOCAB_SPLIT: "ovp_val"
-
-ANNEAL:
-  ENABLED: true
-  L2_BLOCKS: 4
-  FACTOR: 0.9
-
 SOLVER:
   OPTIM: AdamW
-  LR_HEAD: 4.8e-4
-  LR_OTHER: 3.0e-4
-  LR_LORA: 4.8e-4
+  LR_HEAD: 1.25e-3
+  LR_OTHER: 7.5e-4
   WD_HEAD: 0.0
   WD_OTHER: 0.05
-  WD_LORA: 0.05
   BETAS: [0.9, 0.98]
   CLIP_GRAD: 1.0
-  EPOCHS: 25
-  WARMUP_RATIO: 0.08
+  EPOCHS: 3
+  WARMUP_RATIO: 0.05
   LR_SCHEDULE: "cosine"
-
 LOSS:
   MATCH:
     LAMBDA_MASK_IOU: 2.0
@@ -56,50 +61,24 @@ LOSS:
     LAMBDA_BCE: 2.0
     LAMBDA_DICE: 1.0
   OV:
-    KL_TEXT_WEIGHT: 0.5
+    KL_TEXT_WEIGHT: 0.3
     KL_TEMPERATURE: 2.0
     CE_WEIGHT: 1.0
   AUX:
     WEIGHT: 0.3
   DISTILL:
-    FEAT_ALIGN: 0.001
-    ITC_WEIGHT: 0.05
-    TEMPERATURE: 0.07
-
+    FEAT_ALIGN: 0.0
+    ITC_WEIGHT: 0.0
 MODEL:
   BACKBONE:
     NAME: ViT-B-16-SigLIP2-512
     MODEL_ID: "/home/host/siglip2/"
     DROP_PATH: 0.1
     NAFLEX: false
-    FREEZE: false
-    FP16: false
+    FREEZE: true
+    FP16: true
     LORA:
-      ENABLED: true
-      TOTAL_LAYERS: 12
-      LAST_N_LAYERS: 12
-      INCLUDE_PROJ: true
-      DROPOUT: 0.05
-      BIAS: "none"
-      PER_LAYER:
-        - LAYERS: [0, 1, 2, 3, 4, 5, 6, 7]
-          ATTN:
-            RANK: 8
-            ALPHA: 16
-            DROPOUT: 0.05
-          FFN:
-            RANK: 32
-            ALPHA: 48
-            DROPOUT: 0.05
-        - LAYERS: [8, 9, 10, 11]
-          ATTN:
-            RANK: 16
-            ALPHA: 32
-            DROPOUT: 0.05
-          FFN:
-            RANK: 64
-            ALPHA: 64
-            DROPOUT: 0.05
+      ENABLED: false
   HEAD:
     TYPE: EoMT
     NUM_QUERIES: 150
@@ -115,13 +94,12 @@ MODEL:
     CALIBRATION_BIAS: 0.0
     ENERGY_REJECT_THR: -inf
     PER_CLASS_BIAS: "auto"
-
+    SYNONYMS_JSON: null
 EVAL:
   INTERVAL_EPOCHS: 1
-  MIN_MASK_SCORE: 0.05
+  MIN_MASK_SCORE: 0.5
   MIN_AREA: 256
   PQ_METRICS: ["PQ_all", "PQ_things", "PQ_stuff"]
-
 TRAINER:
   PRECISION: "16-mixed"
   DEVICES: 8
@@ -131,17 +109,14 @@ TRAINER:
   SYNC_BATCHNORM: true
   LIMIT_VAL_BATCHES: null
   VAL_CHECK_INTERVAL: 1.0
-
 LOGGING:
   WANDB:
     ENABLED: false
     PROJECT: "eomt"
     ENTITY: null
     GROUP: null
-    NAME: "stageB_siglip2"
-    TAGS: ["stageB", "SigLIP2"]
+    NAME: "stageA_siglip2"
+    TAGS: ["stageA", "SigLIP2"]
     MODE: online
     RESUME: never
-
-OUTPUT_DIR: "outputs/stageB"
-STAGE_BEST_CKPT: "stageB_best.ckpt"
+OUTPUT_DIR: "outputs/coco_eomt_siglip2_stageA"

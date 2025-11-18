@@ -140,7 +140,7 @@ class MaskClassificationPanoptic(LightningModule):
 
         thing_classes = [i for i in range(num_classes) if i not in stuff_classes]
         self.init_metrics_panoptic(
-            thing_classes, stuff_classes, self.network.num_blocks + 1 if self.network.masked_attn_enabled else 1
+            thing_classes, stuff_classes, 1 # self.network.num_blocks + 1 if self.network.masked_attn_enabled else 1
         )
 
     # ------------------------------------------------------------------
@@ -402,28 +402,28 @@ class MaskClassificationPanoptic(LightningModule):
             ):
                 torch.cuda.reset_peak_memory_stats()
 
-    def _update_stage_a_attn_probs(self) -> None:
-        if not self.network.masked_attn_enabled:
-            return
-        total_steps = self._compute_stage_total_steps()
-        progress = 0.0
-        if total_steps > 0:
-            progress = min(1.0, max(0.0, self.global_step / float(total_steps)))
-        value = (1.0 - progress) ** 0.9
-        value = max(0.5, float(value))
-        self.network.attn_mask_probs.fill_(value)
-        self._latest_attn_probs = [float(value)] * len(self.network.attn_mask_probs)
+    # def _update_stage_a_attn_probs(self) -> None:
+    #     if not self.network.masked_attn_enabled:
+    #         return
+    #     total_steps = self._compute_stage_total_steps()
+    #     progress = 0.0
+    #     if total_steps > 0:
+    #         progress = min(1.0, max(0.0, self.global_step / float(total_steps)))
+    #     value = (1.0 - progress) ** 0.9
+    #     value = max(0.5, float(value))
+    #     self.network.attn_mask_probs.fill_(value)
+    #     self._latest_attn_probs = [float(value)] * len(self.network.attn_mask_probs)
 
-    def _update_stage_b_attn_probs(self) -> None:
-        if not self.network.masked_attn_enabled:
-            return
-        total_steps = self._compute_stage_total_steps()
-        if total_steps <= 0:
-            return
-        progress = min(1.0, max(0.0, self.global_step / float(total_steps)))
-        value = max(0.0, float((1.0 - progress) ** 0.9))
-        self.network.attn_mask_probs.fill_(value)
-        self._latest_attn_probs = [value] * len(self.network.attn_mask_probs)
+    # def _update_stage_b_attn_probs(self) -> None:
+    #     if not self.network.masked_attn_enabled:
+    #         return
+    #     total_steps = self._compute_stage_total_steps()
+    #     if total_steps <= 0:
+    #         return
+    #     progress = min(1.0, max(0.0, self.global_step / float(total_steps)))
+    #     value = max(0.0, float((1.0 - progress) ** 0.9))
+    #     self.network.attn_mask_probs.fill_(value)
+    #     self._latest_attn_probs = [value] * len(self.network.attn_mask_probs)
 
     def _monitor_perfplus_memory(self) -> None:
         if self._perfplus_fallback_done:
@@ -486,35 +486,29 @@ class MaskClassificationPanoptic(LightningModule):
             self.trainer.strategy.barrier("stage_best_ckpt")
 
     def on_train_batch_end(self, outputs, batch, batch_idx=None, dataloader_idx=None):
-        if self.stage_is_a:
-            self._update_stage_a_attn_probs()
-            for i, attn_mask_prob in enumerate(self.network.attn_mask_probs):
-                self.log(
-                    f"attn_mask_prob_{i}",
-                    attn_mask_prob,
-                    on_step=True,
-                    sync_dist=True,
-                )
-            self._monitor_perfplus_memory()
+        """
+        训练 batch 结束时的处理。
+        
+        对于 Stage A 和 Stage B：
+        1. 调用父类的 on_train_batch_end 执行标准的退火逻辑
+        2. 执行各自特定的额外处理（内存监控、日志等）
+        """
+        if self.stage_is_a or self.stage_is_b:
+            # ⭐ 关键：调用父类的标准退火实现
+            # 这会执行 lightning_module.py 中的分层退火逻辑
+            super().on_train_batch_end(outputs, batch, batch_idx, dataloader_idx)
+            
+            # Stage A 特定的额外处理
+            if self.stage_is_a:
+                self._monitor_perfplus_memory()
+            
+            # 通用的清理操作（Stage A 和 B 都需要）
             torch.cuda.empty_cache()
             import gc
-
-            gc.collect()
-        elif self.stage_is_b:
-            self._update_stage_b_attn_probs()
-            for i, attn_mask_prob in enumerate(self.network.attn_mask_probs):
-                self.log(
-                    f"attn_mask_prob_{i}",
-                    attn_mask_prob,
-                    on_step=True,
-                    sync_dist=True,
-                )
-            torch.cuda.empty_cache()
-            import gc
-
             gc.collect()
         else:
-            super().on_train_batch_end(outputs, batch, batch_idx=batch_idx, dataloader_idx=dataloader_idx)
+            # 非 Stage A/B 的情况，完全使用父类逻辑
+            super().on_train_batch_end(outputs, batch, batch_idx, dataloader_idx)
 
     def on_train_epoch_end(self):
         super().on_train_epoch_end()
@@ -532,6 +526,21 @@ class MaskClassificationPanoptic(LightningModule):
                 str(self.stage_config.get("stage", "")).upper(),
                 [f"{p:.3f}" for p in self._latest_attn_probs],
             )
+
+            # ⭐ 添加：详细的进度调试信息
+            if self.attn_mask_annealing_enabled and self.network.masked_attn_enabled:
+                total_steps = self._compute_stage_total_steps()
+                progress = self.global_step / total_steps if total_steps > 0 else 0
+                rank_zero_info(
+                    "Stage %s Annealing Debug | global_step=%d total_steps=%d progress=%.2f%% "
+                    "steps_per_epoch=%d stage_total_epochs=%d",
+                    stage_label,
+                    self.global_step,
+                    total_steps,
+                    progress * 100,
+                    self.steps_per_epoch,
+                    self.stage_total_epochs,
+                )
 
     # ------------------------------------------------------------------
 
@@ -567,6 +576,7 @@ class MaskClassificationPanoptic(LightningModule):
             # ⭐ 只评估最后一个block（训练时中间的blocks是辅助损失，验证时不需要）
             if i != len(mask_logits_per_layer) - 1:
                 continue
+
             mask_logits = F.interpolate(mask_logits, self.img_size, mode="bilinear")
             mask_logits = self.revert_resize_and_pad_logits_instance_panoptic(
                 mask_logits, img_sizes
@@ -582,7 +592,9 @@ class MaskClassificationPanoptic(LightningModule):
                 self.overlap_thresh,
                 open_vocab_logits=ov_logits if self.open_vocab_enabled else None,
             )
-            self.update_metrics_panoptic(preds, targets, is_crowds, i)
+            metric_idx = 0
+            self.update_metrics_panoptic(preds, targets, is_crowds, metric_idx)
+            
         if (
             False #batch_idx < 1 #batch_idx % 5 == 0
             and self.trainer.is_global_zero
@@ -599,7 +611,7 @@ class MaskClassificationPanoptic(LightningModule):
             )
     def on_validation_epoch_end(self):
         self._on_eval_epoch_end_panoptic("val")
-        self._maybe_save_stage_best_ckpt()
+        # self._maybe_save_stage_best_ckpt()
         if self.stage_is_b and self._saved_eval_attn_probs is not None:
             self.network.attn_mask_probs.data.copy_(self._saved_eval_attn_probs)
             self._saved_eval_attn_probs = None

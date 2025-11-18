@@ -319,6 +319,18 @@ class LightningModule(lightning.LightningModule):
                         student_selected, teacher_selected, self.distill_feat_weight
                     )
 
+        # 添加调试信息：检查 distill_itc 的前置条件
+        # 添加调试信息：检查 distill_itc 的前置条件
+        if self.distill_itc_weight > 0:
+            has_ov_head = getattr(self.network, "open_vocab_head", None) is not None
+            has_patch_tokens = outputs.get("patch_tokens") is not None
+            
+            # if self.trainer.is_global_zero and batch_idx % 50 == 0:  # 每50个batch打印一次
+            rank_zero_info(
+                f"[Distill ITC Debug] weight={self.distill_itc_weight} "
+                f"has_ov_head={has_ov_head} has_patch_tokens={has_patch_tokens}"
+            )
+
         if (
             self.distill_itc_weight > 0
             and getattr(self.network, "open_vocab_head", None) is not None
@@ -329,17 +341,52 @@ class LightningModule(lightning.LightningModule):
             text_features = self.network.open_vocab_head.text_features.to(image_embs.device)
             paired_text = []
             paired_imgs = []
+            
+            # 调试：记录配对前的信息
+            total_images = len(targets)
+            empty_targets = 0
+            out_of_range = 0
+            
             for img_idx, target in enumerate(targets):
                 if target["labels"].numel() == 0:
+                    empty_targets += 1
                     continue
                 label_id = int(target["labels"][0].item())
                 if label_id < text_features.shape[0]:
                     paired_text.append(text_features[label_id])
                     paired_imgs.append(image_embs[img_idx])
+                else:
+                    out_of_range += 1
+            
+            # 调试：记录配对结果
+            num_paired = len(paired_text)
+            # if self.trainer.is_global_zero and batch_idx % 50 == 0:
+            rank_zero_info(
+                f"[Distill ITC Pairing] total_images={total_images} "
+                f"empty_targets={empty_targets} out_of_range={out_of_range} "
+                f"num_paired={num_paired} text_features_size={text_features.shape[0]}"
+            )
+            
             if paired_text:
                 text_embs = torch.stack(paired_text)
                 img_embs = torch.stack(paired_imgs[: len(paired_text)])
-                extra_losses["distill_itc"] = compute_itc(img_embs, text_embs, self.distill_temperature, self.distill_itc_weight)
+                itc_loss = compute_itc(img_embs, text_embs, self.distill_temperature, self.distill_itc_weight)
+                extra_losses["distill_itc"] = itc_loss
+                
+                # 调试：记录 ITC loss 值
+                # if self.trainer.is_global_zero and batch_idx % 50 == 0:
+                rank_zero_info(
+                    f"[Distill ITC Loss] value={itc_loss.item():.6f} "
+                    f"temperature={self.distill_temperature} weight={self.distill_itc_weight}"
+                )
+            else:
+                # 调试：警告配对失败
+                # if self.trainer.is_global_zero and batch_idx % 50 == 0:
+                rank_zero_warn(
+                    f"[Distill ITC Warning] No valid image-text pairs found! "
+                    f"Cannot compute ITC loss."
+                )
+            
 
         for key, value in extra_losses.items():
             self.log(f"losses/train_{key}", value, sync_dist=True)
@@ -582,8 +629,19 @@ class LightningModule(lightning.LightningModule):
                 metric.false_positives[continuous_id] += 1
 
     def block_postfix(self, block_idx):
+        """
+        生成 block 后缀用于日志记录。
+        
+        当只有 1 个 metric 且 block_idx=0 时，返回空字符串（表示最终输出）。
+        """
         if not self.network.masked_attn_enabled:
             return ""
+
+        # ⭐ 修改：如果只有 1 个 metric（验证时只评估最后一个 block），
+        # 且 block_idx=0，返回空字符串
+        if len(self.metrics) == 1 and block_idx == 0:
+            return ""
+            
         return (
             f"_block_{-len(self.metrics) + block_idx + 1}"
             if block_idx != self.network.num_blocks

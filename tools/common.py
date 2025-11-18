@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import json
+import math
 import logging
 from copy import deepcopy
 from pathlib import Path
@@ -149,7 +149,7 @@ def build_datamodule(cfg: Dict[str, Any]) -> COCOPanopticDirectory:
 
 
 def build_open_vocab_head(cfg: Dict[str, Any]) -> Optional[OpenVocabHead]:
-    ov_cfg = cfg.get("OPEN_VOCAB", {})
+    ov_cfg = cfg.get("MODEL", {}).get("OPEN_VOCAB", {})  # 修改这里
     if not ov_cfg.get("ENABLED", False):
         return None
 
@@ -172,6 +172,44 @@ def build_open_vocab_head(cfg: Dict[str, Any]) -> Optional[OpenVocabHead]:
         per_class_bias = torch.zeros(total_classes)
     else:
         per_class_bias = per_class_bias_cfg
+
+        # ✅ 新增：尝试从 OpenCLIP 加载 text model
+    text_model = None
+    tokenizer = None
+    model_path = Path(text_model_id)
+
+    # 检查是否是 OpenCLIP 格式
+    if model_path.exists() and any((model_path / f).exists() for f in [
+        "open_clip_model.safetensors", 
+        "open_clip_pytorch_model.bin", 
+        "model.open_clip.pt"
+    ]):
+        try:
+            import open_clip
+            LOGGER.info(f"Loading OpenCLIP model from {text_model_id} for text encoder")
+            clip_model, _, preprocess = open_clip.create_model_and_transforms(
+                f"local-dir:{model_path}",
+                device="cpu",
+                precision="fp32",  # 使用 fp32 避免精度问题
+            )
+            # 提取 text model
+            if hasattr(clip_model, 'text'):
+                text_model = clip_model.text
+            elif hasattr(clip_model, 'transformer'):
+                text_model = clip_model.transformer
+            else:
+                LOGGER.warning("OpenCLIP model has no text encoder, falling back to transformers")
+                text_model = None
+            
+            # 创建tokenizer（OpenCLIP 使用自己的 tokenizer）
+            if text_model is not None:
+                tokenizer = open_clip.get_tokenizer(f"local-dir:{model_path}")
+                LOGGER.info("✅ Successfully loaded OpenCLIP text encoder")
+        except Exception as e:
+            LOGGER.warning(f"Failed to load OpenCLIP text model: {e}, falling back to transformers")
+            text_model = None
+            tokenizer = None
+
     head = OpenVocabHead(
         text_model_id=text_model_id,
         templates_things=templates["things"],
@@ -187,12 +225,13 @@ def build_open_vocab_head(cfg: Dict[str, Any]) -> Optional[OpenVocabHead]:
         multilingual=multilingual,
         multilingual_templates=templates.get("multilingual"),
         per_class_bias=per_class_bias,
+        text_model=text_model,  # ✅ 传入已加载的 text_model
+        tokenizer=tokenizer,    # ✅ 传入 tokenizer
     )
     if hasattr(head, "text_model") and head.text_model is not None:
         head.text_model.eval()
         for param in head.text_model.parameters():
             param.requires_grad_(False)
-    return head
     return head
 
 
@@ -245,7 +284,7 @@ def build_network(cfg: Dict[str, Any], backbone: torch.nn.Module, ov_head: Optio
         num_blocks=num_blocks,
         masked_attn_enabled=masked_attn_enabled,
         open_vocab_head=ov_head,
-        fuse_closed_head=bool(cfg.get("OPEN_VOCAB", {}).get("FUSE_CLOSED_HEAD", False)),
+        fuse_closed_head=bool(cfg.get("MODEL", {}).get("OPEN_VOCAB", {}).get("FUSE_CLOSED_HEAD", False)),
         query_init=query_init,
     )
     return network
@@ -322,7 +361,7 @@ def build_module(
     }
 
     img_max = int(data_cfg.get("TRAIN_RES_MAX", 1024))
-    total_layers = getattr(backbone, "num_blocks", network.num_blocks)
+    total_layers = getattr(network.encoder.backbone, "num_blocks", network.num_blocks)    
     start_block = max(0, total_layers - network.num_blocks)
     stage_cfg["query_blocks"] = f"{start_block}..{total_layers - 1}"
     module = MaskClassificationPanoptic(
@@ -537,7 +576,8 @@ def trainer_kwargs(
     if isinstance(stage_value, dict):
         stage_value = stage_value.get("STAGE", "")
 
-    if str(stage_value).upper() == "A":
+    stage_upper = str(stage_value).upper()
+    if stage_upper in ["A", "B"]:  # ⭐ 修改：包含 Stage B
         # 创建专门监控 PQ 的 checkpoint callback
         best_pq_callback = ModelCheckpoint(
             dirpath=str(output_dir),           # 保存目录
@@ -591,6 +631,100 @@ def trainer_kwargs(
             LOGGER.info("Resuming from %s", last_ckpt)
     return kwargs, resume_path
 
+def compute_steps_per_epoch(
+    cfg: Dict[str, Any],
+    datamodule: LightningDataModule,
+) -> int:
+    """
+    计算每个 epoch 的训练步数。
+    
+    在 DDP 模式下，必须手动计算，因为在 Trainer 创建前 dataloader 
+    还没有被 Lightning 转换为使用 DistributedSampler。
+    
+    Args:
+        cfg: 配置字典
+        datamodule: Lightning DataModule 实例
+        
+    Returns:
+        每个 epoch 的步数（全局视角，所有设备同步一次算一步）
+    """
+    import math
+    
+    # 获取数据集大小
+    dataset_size = len(datamodule.train_dataset) if hasattr(datamodule, 'train_dataset') else None
+    
+    # 获取配置参数
+    data_cfg = cfg.get("DATA", {})
+    per_device_batch_size = data_cfg.get("BATCH_SIZE", 1)
+    
+    trainer_cfg = cfg.get("TRAINER", {})
+    num_devices = trainer_cfg.get("DEVICES", 1)
+    if isinstance(num_devices, list):
+        num_devices = len(num_devices)
+    
+    # 计算或获取 global batch size
+    global_batch_size = cfg.get("GLOBAL_BATCH_SIZE")
+    if global_batch_size is None:
+        global_batch_size = per_device_batch_size * num_devices
+        LOGGER.info(
+            "GLOBAL_BATCH_SIZE not specified, calculated as %d × %d = %d",
+            per_device_batch_size, num_devices, global_batch_size
+        )
+    
+    # 手动计算 steps_per_epoch
+    if dataset_size and global_batch_size > 0:
+        # 考虑 drop_last (通常为 True)
+        drop_last = data_cfg.get("DROP_LAST", True)
+        if drop_last:
+            steps_per_epoch = dataset_size // global_batch_size
+        else:
+            steps_per_epoch = math.ceil(dataset_size / global_batch_size)
+        
+        LOGGER.info(
+            "✅ Computed steps_per_epoch=%d (dataset_size=%d, per_device_bs=%d, "
+            "num_devices=%d, global_bs=%d, drop_last=%s)",
+            steps_per_epoch, dataset_size, per_device_batch_size,
+            num_devices, global_batch_size, drop_last
+        )
+        
+        # 验证：与 dataloader 的 len() 进行对比
+        try:
+            train_loader = datamodule.train_dataloader()
+            loader_len = len(train_loader)
+            
+            # 在 DDP setup 前，loader 没有 DistributedSampler
+            # len(loader) 应该约等于 dataset_size / per_device_batch_size
+            if drop_last:
+                expected_loader_len = dataset_size // per_device_batch_size
+            else:
+                expected_loader_len = math.ceil(dataset_size / per_device_batch_size)
+            
+            # 允许 ±1 的误差（边界情况）
+            if abs(loader_len - expected_loader_len) <= 1:
+                LOGGER.debug(
+                    "📊 Dataloader verification OK: len=%d "
+                    "(expected ~%d = %d / %d, pre-DDP mode)",
+                    loader_len, expected_loader_len, dataset_size, per_device_batch_size
+                )
+            else:
+                LOGGER.warning(
+                    "⚠️ Dataloader len=%d differs from expected ~%d "
+                    "(dataset_size=%d / per_device_bs=%d). This may indicate a configuration issue.",
+                    loader_len, expected_loader_len, dataset_size, per_device_batch_size
+                )
+        except Exception as e:
+            LOGGER.debug("Dataloader length verification skipped: %s", e)
+        
+        return steps_per_epoch
+    else:
+        # 降级方案：使用 len(dataloader)
+        LOGGER.warning(
+            "⚠️ Cannot compute steps_per_epoch (dataset_size=%s, global_bs=%s). "
+            "Using len(train_dataloader()) as fallback.",
+            dataset_size, global_batch_size
+        )
+        train_loader = datamodule.train_dataloader()
+        return len(train_loader)
 
 def build_training_components(
     cfg: Dict[str, Any],
@@ -604,7 +738,11 @@ def build_training_components(
     LOGGER.info("Global seed set to %d", seed)
 
     datamodule = build_datamodule(cfg)
-    steps_per_epoch = len(datamodule.train_dataloader())
+    # ⭐ 修改：正确计算 DDP 环境下的 steps_per_epoch
+    train_loader = datamodule.train_dataloader()
+    # ⭐ 简洁调用：计算每个 epoch 的步数
+    steps_per_epoch = compute_steps_per_epoch(cfg, datamodule)
+    
     start_steps, end_steps = compute_mask_schedule(cfg, steps_per_epoch)
 
     backbone, backbone_frozen = build_backbone_from_cfg(cfg)
@@ -621,6 +759,42 @@ def build_training_components(
             steps_per_epoch,      # ⭐ 添加缺失参数
             backbone_frozen,      # ⭐ 添加缺失参数
         )
+
+    # ⭐ 新增：处理 Stage B 从 Stage A checkpoint 加载
+    stage_a_ckpt = cfg.get("RESUME_FROM_STAGE_A")
+    if stage_a_ckpt:
+        stage_a_path = Path(stage_a_ckpt)
+        if stage_a_path.exists():
+            LOGGER.info(f"Loading Stage A checkpoint from: {stage_a_ckpt}")
+            try:
+                checkpoint = torch.load(stage_a_ckpt, map_location="cpu")
+                state_dict = checkpoint.get("state_dict", checkpoint)
+                
+                # 加载权重，strict=False 允许 LoRA 参数不匹配
+                missing_keys, unexpected_keys = module.load_state_dict(state_dict, strict=False)
+                
+                # 过滤掉预期的 LoRA 相关的 missing keys（因为 Stage A 没有 LoRA）
+                lora_missing = [k for k in missing_keys if "lora" in k.lower()]
+                other_missing = [k for k in missing_keys if "lora" not in k.lower()]
+                
+                LOGGER.info(f"✅ Loaded Stage A checkpoint successfully")
+                LOGGER.info(f"  - LoRA params (expected missing): {len(lora_missing)}")
+                if other_missing:
+                    LOGGER.warning(f"  - Other missing keys: {len(other_missing)}")
+                    if len(other_missing) < 10:
+                        for key in other_missing:
+                            LOGGER.warning(f"    - {key}")
+                if unexpected_keys:
+                    LOGGER.warning(f"  - Unexpected keys: {len(unexpected_keys)}")
+                    if len(unexpected_keys) < 10:
+                        for key in unexpected_keys:
+                            LOGGER.warning(f"    - {key}")
+            except Exception as e:
+                LOGGER.error(f"❌ Failed to load Stage A checkpoint: {e}")
+                raise
+        else:
+            LOGGER.error(f"❌ Stage A checkpoint not found: {stage_a_ckpt}")
+            raise FileNotFoundError(f"Stage A checkpoint not found: {stage_a_ckpt}")
 
     if hasattr(backbone, "get_lora_summary"):
         summary = backbone.get_lora_summary()

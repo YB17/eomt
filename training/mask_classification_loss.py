@@ -133,11 +133,32 @@ class MaskClassificationLoss(Mask2FormerLoss):
                 continue
             logits = open_vocab_logits[batch_idx, src_idx]
             labels = targets[batch_idx]["labels"][tgt_idx].to(device)
+            
+            # ✅ 关键修复：确保 labels 在有效范围内
+            num_classes = logits.shape[-1]
+            invalid_mask = (labels < 0) | (labels >= num_classes)
+            if invalid_mask.any():
+                import logging
+                logger = logging.getLogger(__name__)
+                invalid_labels = labels[invalid_mask].tolist()
+                logger.error(
+                    f"Batch {batch_idx}: Found {invalid_mask.sum().item()} invalid labels "
+                    f"{invalid_labels} (valid range: [0, {num_classes-1}]). Clamping to valid range."
+                )
+                # 将无效 labels 映射到0（背景）
+                labels = torch.where(invalid_mask, torch.zeros_like(labels), labels)
+        
             ce_loss = ce_loss + F.cross_entropy(logits, labels, reduction="sum")
             ce_count += len(src_idx)
 
             if text_priors is not None and self.open_vocab_kl_weight > 0:
                 priors = text_priors[batch_idx]
+                # ✅ 确保 priors 的维度正确
+                if priors.shape[-1] != num_classes:
+                    logger.warning(
+                        f"text_priors shape mismatch: {priors.shape} vs expected (..., {num_classes})"
+                    )
+                    continue
                 if priors.dim() == 3:
                     priors = priors[src_idx]
                 elif priors.dim() == 2:

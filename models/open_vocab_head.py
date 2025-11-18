@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging  # ← 添加这一行
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
@@ -13,6 +14,8 @@ except Exception:  # pragma: no cover - optional dependency
     AutoModel = None  # type: ignore
     AutoTokenizer = None  # type: ignore
 
+# ← 添加这一行
+LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class VocabularyTemplates:
@@ -81,8 +84,84 @@ class OpenVocabHead(nn.Module):
         self.register_buffer("class_splits", torch.zeros(2, dtype=torch.long), persistent=True)
         self.text_projection: Optional[nn.Linear] = None
         self.class_name_list: List[str] = []
+
+        # 如果是分布式训练，只在 rank 0 编码
         if self.class_names_things or self.class_names_stuff:
-            self._build_text_features()
+            # 检查是否分布式
+            is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+            rank = torch.distributed.get_rank() if is_distributed else 0
+            
+            if rank == 0:
+                # 只有 rank 0 进行编码
+                if self.text_model is not None and torch.cuda.is_available():
+                    self.text_model = self.text_model.to('cuda:0')
+                    LOGGER.info("Rank 0: Encoding text features on GPU")
+                self._build_text_features()
+                if self.text_model is not None:
+                    del self.text_model
+                    del self.tokenizer
+                    self.text_model = None
+                    self.tokenizer = None
+            
+            # 所有进程等待 rank 0 完成
+            if is_distributed:
+                torch.distributed.barrier()
+                # ✅ 广播形状信息
+                if rank == 0:
+                    shape_info = torch.tensor([self.text_features.shape[0], self.text_features.shape[1]], dtype=torch.long)
+                else:
+                    shape_info = torch.tensor([0, 0], dtype=torch.long)
+                
+                torch.distributed.broadcast(shape_info, src=0)
+                
+                # ✅ 其他 ranks 根据形状信息创建相同大小的张量
+                if rank != 0:
+                    num_classes = int(shape_info[0].item())
+                    hidden_size = int(shape_info[1].item())
+                    self.text_features = torch.zeros(num_classes, hidden_size, dtype=torch.float32)
+                    LOGGER.info(f"Rank {rank}: Allocated text_features with shape ({num_classes}, {hidden_size})")
+                
+                # ✅ 广播 text_features 和 class_splits
+                torch.distributed.broadcast(self.text_features, src=0)
+                torch.distributed.broadcast(self.class_splits, src=0)
+                
+                LOGGER.info(f"Rank {rank}: Received text_features with shape {self.text_features.shape}")
+
+
+    def state_dict(self, *args, destination=None, prefix='', keep_vars=False):
+        """
+        自定义 state_dict，排除 text_model 的参数。
+        text_model 是冻结的预训练模型，每次都从相同路径加载。
+        """
+        # 调用父类方法获取完整的 state_dict
+        state = super().state_dict(*args, destination=destination, prefix=prefix, keep_vars=keep_vars)
+        
+        # 过滤掉 text_model 的键
+        keys_to_remove = [k for k in state.keys() if k.startswith(f'{prefix}text_model.')]
+        for key in keys_to_remove:
+            del state[key]
+        
+        return state
+    
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        """
+        自定义加载逻辑，允许 text_model 的参数缺失。
+        这些参数会在初始化时自动加载。
+        """
+        # 记录缺失的 text_model 键（这些是预期的）
+        text_model_missing = [k for k in missing_keys if 'text_model' in k]
+        
+        # 从 missing_keys 中移除 text_model 相关的键
+        missing_keys[:] = [k for k in missing_keys if 'text_model' not in k]
+        
+        # 调用父类方法
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+        
+        # 可选：记录日志
+        if text_model_missing:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"Skipped loading {len(text_model_missing)} text_model parameters (will be loaded from {self.text_model_id})")
 
     # ------------------------------------------------------------------
     # text encoding helpers
@@ -94,22 +173,58 @@ class OpenVocabHead(nn.Module):
         if self.multilingual and self.multilingual_templates:
             for name in names:
                 prompts.extend(template.format(name) for template in self.multilingual_templates)
-        tokenized = self.tokenizer(
-            prompts,
-            padding=True,
-            truncation=True,
-            return_tensors="pt",
-        )
-        tokenized = {k: v.to(self.text_model.device) for k, v in tokenized.items()}
-        with torch.no_grad():
-            outputs = self.text_model(**tokenized)
-        if hasattr(outputs, "text_embeds") and outputs.text_embeds is not None:
-            feats = outputs.text_embeds
-        elif hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
-            feats = outputs.pooler_output
+
+        # ✅ 获取设备（兼容 OpenCLIP 和 Transformers）
+        if hasattr(self.text_model, 'device'):
+            device = self.text_model.device
         else:
-            hidden = outputs.last_hidden_state
-            feats = hidden[:, -1, :]
+            # OpenCLIP text_model 没有 .device，从参数中获取
+            device = next(self.text_model.parameters()).device
+        
+        # ✅ 检测 tokenizer 类型并适配
+        tokenizer_type = type(self.tokenizer).__name__
+        
+        if "HFTokenizer" in tokenizer_type or "SimpleTokenizer" in tokenizer_type:
+            # OpenCLIP tokenizer: 直接调用，返回 tensor
+            tokenized = self.tokenizer(prompts)
+            if not isinstance(tokenized, dict):
+                tokenized = {"input_ids": tokenized}
+            tokenized = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                        for k, v in tokenized.items()}
+        else:
+            # Transformers tokenizer: 使用 padding 等参数
+            tokenized = self.tokenizer(
+                prompts,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+            )
+            tokenized = {k: v.to(device) for k, v in tokenized.items()}
+          
+        with torch.no_grad():
+            # ✅ 适配不同的 text_model 调用方式
+            if hasattr(self.text_model, '__call__'):
+                # OpenCLIP text encoder: 直接调用
+                if "input_ids" in tokenized and len(tokenized) == 1:
+                    # OpenCLIP 只需要 input_ids
+                    outputs = self.text_model(tokenized["input_ids"])
+                else:
+                    outputs = self.text_model(**tokenized)
+            else:
+                outputs = self.text_model(**tokenized)
+            
+            # ✅ 适配不同的输出格式
+            if isinstance(outputs, torch.Tensor):
+                # OpenCLIP 直接返回 tensor
+                feats = outputs
+            elif hasattr(outputs, "text_embeds") and outputs.text_embeds is not None:
+                feats = outputs.text_embeds
+            elif hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+                feats = outputs.pooler_output
+            else:
+                hidden = outputs.last_hidden_state
+                feats = hidden[:, -1, :]
+
         feats = F.normalize(feats, dim=-1)
         num_templates = len(prompts) // len(names)
         feats = feats.view(len(names), num_templates, -1).mean(dim=1)

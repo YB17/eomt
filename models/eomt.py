@@ -244,7 +244,24 @@ class EoMT(nn.Module):
                 self.num_q + self.encoder.backbone.num_prefix_tokens :,
                 :,
             ]
-            ov_out = self.open_vocab_head(mask_logits, patch_tokens)
+
+            # ✅ 获取 patch grid 尺寸
+            patch_grid_size = self.encoder.backbone.patch_embed.grid_size
+
+            # ✅ 下采样 mask_logits 到 patch 分辨率
+            # mask_logits 当前是高分辨率（经过 upscale）
+            # 需要下采样到 patch_tokens 的空间分辨率
+            if mask_logits.shape[-2:] != patch_grid_size:
+                mask_logits_for_ov = F.interpolate(
+                    mask_logits,
+                    size=patch_grid_size,
+                    mode='bilinear',
+                    align_corners=False
+                )
+            else:
+                mask_logits_for_ov = mask_logits
+
+            ov_out = self.open_vocab_head(mask_logits_for_ov, patch_tokens)
             ov_logits = ov_out["logits"]
             if (
                 self.fuse_closed_head

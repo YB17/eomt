@@ -4,6 +4,7 @@ from typing import Iterable, List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers.models.mask2former.modeling_mask2former import (
     Mask2FormerHungarianMatcher,
     pair_wise_sigmoid_cross_entropy_loss,
@@ -85,15 +86,38 @@ class OpenVocabHungarianMatcher(Mask2FormerHungarianMatcher):
                 cost_ov = -prob_open[:, gather_ids]
                 cost_class = (cost_class + cost_ov) * 0.5
                 if text_priors is not None and self.kl_weight > 0:
-                    priors = text_priors[i]
-                    if priors.dim() == 2:
-                        priors = priors[gt_classes]
-                    else:
-                        priors = priors[:, gt_classes]
-                    priors = priors.clamp(min=1e-6)
-                    kl_source = prob_open[:, gather_ids].clamp(min=1e-6)
-                    kl_loss = (priors * (priors.log() - kl_source.log())).sum(dim=-1)
-                    cost_class = cost_class + self.kl_weight * kl_loss
+                    # 1. 获取教师的先验 logits（相似度）
+                    priors = text_priors[i]  # (num_queries, num_classes) = (150, 133)
+                 
+                    # 2. 将教师的先验转换为概率分布
+                    #    可以使用温度系数来控制分布的"软硬"程度
+                    tau_teacher = 2.0  # 温度系数，越大分布越平滑
+                    teacher_probs = F.softmax(priors / tau_teacher, dim=-1)  # (150, 133)
+                    
+                    # 3. 学生的预测概率（已经是归一化的）
+                    student_probs = prob_open  # (150, 133)
+                    
+                    # 4. 计算标准 KL 散度：D_KL(teacher || student)
+                    #    在类别维度（最后一维）上求和
+                    #    使用 PyTorch 的 kl_div：需要 log(student) 和 teacher
+                    student_log_probs = torch.log(student_probs.clamp(min=1e-8))  # (150, 133)
+                    
+                    # F.kl_div 计算 KL(target || input)，所以参数顺序是 (student_log, teacher)
+                    # reduction='batchmean' 会自动在最后一维求和
+                    kl_per_query = F.kl_div(
+                        student_log_probs, 
+                        teacher_probs, 
+                        reduction='none'  # 不自动求和，手动控制
+                    ).sum(dim=-1)  # 在类别维度求和 → (150,)
+                    
+                    # 5. 现在 kl_per_query 是每个 query 的总体 KL 散度
+                    #    它表示该 query 的预测与教师先验的差异程度
+                    #    需要扩展到 (num_queries, num_targets) 以匹配 cost_class 的形状
+                    num_targets = gt_classes.numel()
+                    kl_cost = kl_per_query.unsqueeze(1).expand(-1, num_targets)  # (150, 11)
+                    
+                    # 6. 添加到分类成本中
+                    cost_class = cost_class + self.kl_weight * kl_cost  # (150, 11) + (150, 11)
 
             if seen_mask is not None and i < len(seen_mask):
                 seen_flags = seen_mask[i].to(gt_classes.device).bool()
