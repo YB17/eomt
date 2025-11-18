@@ -10,6 +10,7 @@
 
 
 from typing import Dict, List, Optional
+import logging
 import torch.distributed as dist
 import torch
 import torch.nn as nn
@@ -69,6 +70,37 @@ class MaskClassificationLoss(Mask2FormerLoss):
                 cost_class=class_coefficient,
             )
 
+        self._logger = logging.getLogger(__name__)
+
+    def _sanitize_labels(
+        self,
+        labels: torch.Tensor,
+        batch_idx: int,
+        *,
+        num_classes: Optional[int] = None,
+        context: str = "class head",
+    ) -> torch.Tensor:
+        """Ensure labels stay within the valid range for a given head."""
+        limit = self.num_labels if num_classes is None else int(num_classes)
+        if labels.numel() == 0 or limit <= 0:
+            return labels
+
+        invalid = (labels < 0) | (labels >= limit)
+        if not invalid.any():
+            return labels
+
+        invalid_vals = labels[invalid].tolist()
+        self._logger.error(
+            "Clamping %d invalid %s labels %s in batch %d (valid range: [0, %d)).",
+            len(invalid_vals),
+            context,
+            invalid_vals,
+            batch_idx,
+            limit,
+        )
+
+        return labels.clamp(0, max(limit - 1, 0))
+
     @torch.compiler.disable
     def forward(
         self,
@@ -80,7 +112,12 @@ class MaskClassificationLoss(Mask2FormerLoss):
         seen_mask: Optional[List[torch.Tensor]] = None,
     ):
         mask_labels = [target["masks"].to(masks_queries_logits.dtype) for target in targets]
-        class_labels = [target["labels"].long() for target in targets]
+        class_labels: List[torch.Tensor] = []
+        for batch_idx, target in enumerate(targets):
+            labels = target["labels"].long()
+            labels = self._sanitize_labels(labels, batch_idx)
+            target["labels"] = labels
+            class_labels.append(labels)
         # 只用is_thing作为标签，thing=1, stuff=0
         # class_labels = [target["is_thing"].long() for target in targets]
 
@@ -133,30 +170,25 @@ class MaskClassificationLoss(Mask2FormerLoss):
                 continue
             logits = open_vocab_logits[batch_idx, src_idx]
             labels = targets[batch_idx]["labels"][tgt_idx].to(device)
-            
-            # ✅ 关键修复：确保 labels 在有效范围内
+
             num_classes = logits.shape[-1]
-            invalid_mask = (labels < 0) | (labels >= num_classes)
-            if invalid_mask.any():
-                import logging
-                logger = logging.getLogger(__name__)
-                invalid_labels = labels[invalid_mask].tolist()
-                logger.error(
-                    f"Batch {batch_idx}: Found {invalid_mask.sum().item()} invalid labels "
-                    f"{invalid_labels} (valid range: [0, {num_classes-1}]). Clamping to valid range."
-                )
-                # 将无效 labels 映射到0（背景）
-                labels = torch.where(invalid_mask, torch.zeros_like(labels), labels)
+            labels = self._sanitize_labels(
+                labels,
+                batch_idx,
+                num_classes=num_classes,
+                context="open-vocab",
+            )
         
             ce_loss = ce_loss + F.cross_entropy(logits, labels, reduction="sum")
             ce_count += len(src_idx)
 
             if text_priors is not None and self.open_vocab_kl_weight > 0:
                 priors = text_priors[batch_idx]
-                # ✅ 确保 priors 的维度正确
                 if priors.shape[-1] != num_classes:
-                    logger.warning(
-                        f"text_priors shape mismatch: {priors.shape} vs expected (..., {num_classes})"
+                    self._logger.warning(
+                        "text_priors shape mismatch: %s vs expected (..., %d)",
+                        tuple(priors.shape),
+                        num_classes,
                     )
                     continue
                 if priors.dim() == 3:
