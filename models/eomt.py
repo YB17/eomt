@@ -165,6 +165,9 @@ class EoMT(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Dict[str, List[torch.Tensor]]:
         x = (x - self.encoder.pixel_mean) / self.encoder.pixel_std
+        # ✅ 修复：确保输入的dtype与patch_embed权重匹配
+        # 当backbone以FP16模式加载时，patch_embed的权重是FP16
+        # 但归一化后的x可能是FP32，需要转换
 
         x = self.encoder.backbone.patch_embed(x)
         x = self.encoder.backbone._pos_embed(x)

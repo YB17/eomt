@@ -1,6 +1,6 @@
 STAGE: "A"
-EPOCHS: 3
-GLOBAL_BATCH_SIZE: 80
+EPOCHS: 1
+GLOBAL_BATCH_SIZE: 60
 BACKBONE_FREEZE: true
 USE_LORA: false
 SEED: 3407
@@ -49,7 +49,7 @@ SOLVER:
   WD_OTHER: 0.05
   BETAS: [0.9, 0.98]
   CLIP_GRAD: 1.0
-  EPOCHS: 3
+  EPOCHS: 1
   WARMUP_RATIO: 0.05
   LR_SCHEDULE: "cosine"
 LOSS:
@@ -102,7 +102,7 @@ EVAL:
   PQ_METRICS: ["PQ_all", "PQ_things", "PQ_stuff"]
 TRAINER:
   PRECISION: "16-mixed"
-  DEVICES: 8
+  DEVICES: 6
   NUM_NODES: 1
   ACCELERATOR: "gpu"
   STRATEGY: "ddp_find_unused_parameters_true"

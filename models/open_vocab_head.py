@@ -256,6 +256,9 @@ class OpenVocabHead(nn.Module):
         things = encode_group(self.class_names_things, self.templates_things)
         stuff = encode_group(self.class_names_stuff, self.templates_stuff)
 
+        # ✅ 添加调试信息
+        LOGGER.info(f"Encoded {things.shape[0]} things classes, {stuff.shape[0]} stuff classes")
+
         if things.numel() > 0:
             all_features.append(things)
         if stuff.numel() > 0:
@@ -271,6 +274,11 @@ class OpenVocabHead(nn.Module):
                 persistent=True,
             )
             self.class_name_list = class_order
+            # ✅ 关键验证信息
+            LOGGER.info(f"✅ Built text_features: shape={text_features.shape}, "
+                       f"total_classes={len(class_order)}, "
+                       f"class_range=[0, {text_features.shape[0]-1}]")
+ 
         else:
             self.register_buffer("text_features", torch.empty(0, device=device), persistent=True)
             self.register_buffer("class_splits", torch.tensor([0, 0], dtype=torch.long, device=device), persistent=True)

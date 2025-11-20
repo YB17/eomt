@@ -696,19 +696,32 @@ class MaskClassificationPanoptic(LightningModule):
         if head is None:
             return None
         device = self.device
-        with torch.inference_mode():
-            head.temperature.data.copy_(torch.tensor(float(tau_value), device=head.temperature.device))
-            if base_bias is not None and head.per_class_bias is not None:
-                scaled = base_bias * bias_scale
-                head.per_class_bias.data.copy_(scaled.to(head.per_class_bias.device))
-            for metric in self.metrics:
-                metric.reset()
-            for batch_idx, batch in enumerate(loader):
-                imgs, targets = batch
-                imgs = tuple(self._move_to_device(img, device) for img in imgs)
-                targets = tuple(self._move_to_device(target, device) for target in targets)
-                self.eval_step((imgs, targets), batch_idx=batch_idx, log_prefix="calib")
-            scores = self._collect_panoptic_scores()
+        
+        # ✅ 检测是否需要混合精度（根据训练配置）
+        use_amp = getattr(self.trainer, "precision", None) in ["16-mixed", "bf16-mixed"] if self.trainer else False
+        
+        # ✅ 关键修复：autocast 必须在 inference_mode/no_grad 外层
+        # 并且使用 no_grad 而不是 inference_mode，因为 inference_mode 更严格
+        autocast_ctx = torch.cuda.amp.autocast(enabled=use_amp, dtype=torch.float16)
+        inference_ctx = torch.no_grad()  # 改用 no_grad 替代 inference_mode
+        
+        with autocast_ctx:  # ✅ autocast 在外层
+            with inference_ctx:  # ✅ no_grad 在内层
+                head.temperature.data.copy_(torch.tensor(float(tau_value), device=head.temperature.device))
+                if base_bias is not None and head.per_class_bias is not None:
+                    scaled = base_bias * bias_scale
+                    head.per_class_bias.data.copy_(scaled.to(head.per_class_bias.device))
+                for metric in self.metrics:
+                    metric.reset()
+                for batch_idx, batch in enumerate(loader):
+                    imgs, targets = batch
+                    imgs = tuple(self._move_to_device(img, device) for img in imgs)
+                    targets = tuple(self._move_to_device(target, device) for target in targets)
+                    
+                    # ✅ 直接调用 eval_step，autocast 已经在外层生效
+                    self.eval_step((imgs, targets), batch_idx=batch_idx, log_prefix="calib")
+                
+                scores = self._collect_panoptic_scores()
         return scores
 
     def _run_stage_a_calibration(self) -> None:

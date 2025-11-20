@@ -53,7 +53,11 @@ class OpenVocabHungarianMatcher(Mask2FormerHungarianMatcher):
             pred_mask = pred_mask[:, None]
 
             if target_mask.shape[0] == 0:
-                indices.append((torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64)))
+                # ✅ 修复：确保空索引在正确的设备上
+                indices.append((
+                    torch.empty(0, dtype=torch.int64, device=pred_mask.device),
+                    torch.empty(0, dtype=torch.int64, device=pred_mask.device)
+                ))
                 continue
 
             point_coordinates = torch.rand(1, self.num_points, 2, device=pred_mask.device)
@@ -75,7 +79,11 @@ class OpenVocabHungarianMatcher(Mask2FormerHungarianMatcher):
             gt_classes = class_labels[i]
             num_targets = gt_classes.numel()
             if num_targets == 0:
-                indices.append((torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64)))
+                # ✅ 修复：确保空索引在正确的设备上
+                indices.append((
+                    torch.empty(0, dtype=torch.int64, device=pred_mask.device),
+                    torch.empty(0, dtype=torch.int64, device=pred_mask.device)
+                ))
                 continue
 
             cost_class = -prob_closed[:, gt_classes]

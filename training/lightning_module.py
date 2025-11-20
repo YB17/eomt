@@ -1020,7 +1020,7 @@ class LightningModule(lightning.LightningModule):
 
         for img in imgs:
             new_h, new_w = self.scale_img_size_instance_panoptic(img.shape[-2:])
-
+            
             pil_img = Image.fromarray(img.permute(1, 2, 0).cpu().numpy())
             pil_img = pil_img.resize((new_w, new_h), Image.BILINEAR)
             resized_img = (

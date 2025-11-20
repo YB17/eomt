@@ -73,21 +73,27 @@ class MaskClassificationLoss(Mask2FormerLoss):
         self._logger = logging.getLogger(__name__)
 
     def _sanitize_labels(self, labels: torch.Tensor, batch_idx: int) -> torch.Tensor:
-        """确保标签位于[0, num_labels)范围内，防止CUDA索引越界。"""
+        """确保标签位于[0, num_labels)范围内，防止CUDA索引越界。
+        
+        注意：closed-set分类器有 num_labels+1 个输出（最后一个是no-object类），
+        但ground truth labels应该在 [0, num_labels-1] 范围内。
+        """
         if labels.numel() == 0 or self.num_labels <= 0:
             return labels
 
+        # ✅ 确保labels在 [0, num_labels-1] 范围内
+        # num_labels = 133，所以有效范围是 [0, 132]
         invalid = (labels < 0) | (labels >= self.num_labels)
         if not invalid.any():
             return labels
 
         invalid_vals = labels[invalid].tolist()
         self._logger.error(
-            "Clamping %d invalid class labels %s in batch %d (valid range: [0, %d)).",
+            "❌ Found %d invalid class labels %s in batch %d (valid range: [0, %d]). Clamping.",
             len(invalid_vals),
             invalid_vals,
             batch_idx,
-            self.num_labels,
+            self.num_labels - 1,  # ✅ 显示正确的最大值
         )
 
         return labels.clamp(0, self.num_labels - 1)
@@ -107,7 +113,7 @@ class MaskClassificationLoss(Mask2FormerLoss):
         for batch_idx, target in enumerate(targets):
             labels = target["labels"].long()
             labels = self._sanitize_labels(labels, batch_idx)
-            target["labels"] = labels
+            target["labels"] = labels  # ✅ 更新target中的labels
             class_labels.append(labels)
         # 只用is_thing作为标签，thing=1, stuff=0
         # class_labels = [target["is_thing"].long() for target in targets]
@@ -161,9 +167,11 @@ class MaskClassificationLoss(Mask2FormerLoss):
                 continue
             logits = open_vocab_logits[batch_idx, src_idx]
             labels = targets[batch_idx]["labels"][tgt_idx].to(device)
-            
+
             # ✅ 关键修复：确保 labels 在有效范围内
             num_classes = logits.shape[-1]
+            
+            # ✅ 关键修复：确保 labels 在有效范围内
             invalid_mask = (labels < 0) | (labels >= num_classes)
             if invalid_mask.any():
                 import logging
@@ -176,25 +184,25 @@ class MaskClassificationLoss(Mask2FormerLoss):
                 # 将无效 labels 映射到0（背景）
                 labels = torch.where(invalid_mask, torch.zeros_like(labels), labels)
         
+            
             ce_loss = ce_loss + F.cross_entropy(logits, labels, reduction="sum")
             ce_count += len(src_idx)
 
             if text_priors is not None and self.open_vocab_kl_weight > 0:
-                priors = text_priors[batch_idx]
-                # ✅ 确保 priors 的维度正确
-                if priors.shape[-1] != num_classes:
-                    logger.warning(
-                        f"text_priors shape mismatch: {priors.shape} vs expected (..., {num_classes})"
-                    )
-                    continue
+                priors = text_priors[batch_idx]  # (num_queries, num_classes)
+                
+                # ✅ 修复：text_priors 对应的是queries，应该用 src_idx 选择
                 if priors.dim() == 3:
-                    priors = priors[src_idx]
+                    # 如果是3维，第一维可能是batch，已经在上面选择了
+                    priors = priors[src_idx]  # ← 改用 src_idx
                 elif priors.dim() == 2:
-                    priors = priors[tgt_idx]
+                    # 2维情况：(num_queries, num_classes)
+                    priors = priors[src_idx]  # ← 改用 src_idx，不是 tgt_idx！
                 elif priors.dim() == 1:
                     priors = priors.unsqueeze(0).expand_as(logits)
                 else:
                     priors = priors.expand_as(logits)
+                
                 priors = priors.detach()
                 tau_text = getattr(self, "open_vocab_kl_teacher_temp", 2.0)
                 priors = priors / max(tau_text, 1e-6)
