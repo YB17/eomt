@@ -26,6 +26,7 @@ from torchmetrics.functional.detection._panoptic_quality_common import (
 )
 import wandb
 from PIL import Image
+from torchvision.transforms.functional import to_pil_image
 import matplotlib.colors as mcolors
 from matplotlib.lines import Line2D
 import io
@@ -923,7 +924,8 @@ class LightningModule(lightning.LightningModule):
         for i in range(len(imgs)):
             img = imgs[i]
             new_h, new_w = self.scale_img_size_semantic(img.shape[-2:])
-            pil_img = Image.fromarray(img.permute(1, 2, 0).cpu().numpy())
+            img_for_pil = img.clamp(0, 1) if torch.is_floating_point(img) else img
+            pil_img = to_pil_image(img_for_pil)
             resized_img = pil_img.resize((new_w, new_h), Image.BILINEAR)
             resized_img = (
                 torch.from_numpy(np.array(resized_img)).permute(2, 0, 1).to(img.device)
@@ -1020,8 +1022,9 @@ class LightningModule(lightning.LightningModule):
 
         for img in imgs:
             new_h, new_w = self.scale_img_size_instance_panoptic(img.shape[-2:])
-            
-            pil_img = Image.fromarray(img.permute(1, 2, 0).cpu().numpy())
+
+            img_for_pil = img.clamp(0, 1) if torch.is_floating_point(img) else img
+            pil_img = to_pil_image(img_for_pil)
             pil_img = pil_img.resize((new_w, new_h), Image.BILINEAR)
             resized_img = (
                 torch.from_numpy(np.array(pil_img)).permute(2, 0, 1).to(img.device)
