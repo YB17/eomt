@@ -37,6 +37,9 @@ class MaskClassificationLoss(Mask2FormerLoss):
         open_vocab_enabled: bool = False,
         open_vocab_kl_weight: float = 0.0,
         open_vocab_kl_teacher_temp: float = 2.0,
+        open_vocab_kl_seen_only: bool = False,
+        open_vocab_kl_top_p: Optional[float] = None,
+        open_vocab_kl_top_k: Optional[int] = None,
         matcher_weights: Optional[dict[str, float]] = None,
     ):
         nn.Module.__init__(self)
@@ -51,6 +54,9 @@ class MaskClassificationLoss(Mask2FormerLoss):
         self.open_vocab_enabled = open_vocab_enabled
         self.open_vocab_kl_weight = open_vocab_kl_weight
         self.open_vocab_kl_teacher_temp = open_vocab_kl_teacher_temp
+        self.open_vocab_kl_seen_only = bool(open_vocab_kl_seen_only)
+        self.open_vocab_kl_top_p = open_vocab_kl_top_p
+        self.open_vocab_kl_top_k = open_vocab_kl_top_k
         self.matcher_weights = matcher_weights or {}
         empty_weight = torch.ones(self.num_labels + 1)
         empty_weight[-1] = self.eos_coef
@@ -145,6 +151,7 @@ class MaskClassificationLoss(Mask2FormerLoss):
                 targets=targets,
                 matched_indices=indices,
                 text_priors=text_priors,
+                seen_mask=seen_mask,
             )
 
         return {**loss_masks, **loss_classes, **ov_losses}
@@ -155,6 +162,7 @@ class MaskClassificationLoss(Mask2FormerLoss):
         targets: List[dict],
         matched_indices: List[tuple[torch.Tensor, torch.Tensor]],
         text_priors: Optional[torch.Tensor] = None,
+        seen_mask: Optional[List[torch.Tensor]] = None,
     ) -> dict[str, torch.Tensor]:
         device = open_vocab_logits.device
         ce_loss = torch.tensor(0.0, device=device)
@@ -209,6 +217,31 @@ class MaskClassificationLoss(Mask2FormerLoss):
                 reject_mask = torch.isinf(logits)
                 if reject_mask.any():
                     priors = priors.masked_fill(reject_mask, float("-inf"))
+                if self.open_vocab_kl_seen_only and seen_mask is not None:
+                    if batch_idx < len(seen_mask):
+                        seen_flags = seen_mask[batch_idx].to(device)
+                        if seen_flags.dim() == 1:
+                            seen_flags = seen_flags.unsqueeze(0).expand_as(priors)
+                        if seen_flags.shape == priors.shape:
+                            priors = priors.masked_fill(~seen_flags.bool(), float("-inf"))
+                if self.open_vocab_kl_top_p is not None or self.open_vocab_kl_top_k is not None:
+                    probs = F.softmax(priors, dim=-1)
+                    top_p = self.open_vocab_kl_top_p
+                    top_k = self.open_vocab_kl_top_k
+                    keep_mask = torch.ones_like(priors, dtype=torch.bool)
+                    if top_p is not None:
+                        sorted_probs, sorted_idx = probs.sort(dim=-1, descending=True)
+                        cumulative = sorted_probs.cumsum(dim=-1)
+                        keep_sorted = cumulative <= float(top_p)
+                        keep_sorted[..., 0] = True
+                        keep_mask = keep_mask.scatter(-1, sorted_idx, keep_sorted)
+                    elif top_k is not None and top_k > 0:
+                        top_k = min(int(top_k), priors.shape[-1])
+                        keep_sorted = torch.zeros_like(priors, dtype=torch.bool)
+                        top_values, top_indices = probs.topk(top_k, dim=-1)
+                        keep_sorted = keep_sorted.scatter(-1, top_indices, True)
+                        keep_mask = keep_mask & keep_sorted
+                    priors = priors.masked_fill(~keep_mask, float("-inf"))
                 teacher_probs = F.softmax(priors, dim=-1)
                 student_log = F.log_softmax(logits, dim=-1)
                 kl_loss = kl_loss + F.kl_div(student_log, teacher_probs, reduction="sum")
