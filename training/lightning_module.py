@@ -327,10 +327,10 @@ class LightningModule(lightning.LightningModule):
             has_patch_tokens = outputs.get("patch_tokens") is not None
             
             # if self.trainer.is_global_zero and batch_idx % 50 == 0:  # 每50个batch打印一次
-            rank_zero_info(
-                f"[Distill ITC Debug] weight={self.distill_itc_weight} "
-                f"has_ov_head={has_ov_head} has_patch_tokens={has_patch_tokens}"
-            )
+            # rank_zero_info(
+            #     f"[Distill ITC Debug] weight={self.distill_itc_weight} "
+            #     f"has_ov_head={has_ov_head} has_patch_tokens={has_patch_tokens}"
+            # )
 
         if (
             self.distill_itc_weight > 0
@@ -362,11 +362,11 @@ class LightningModule(lightning.LightningModule):
             # 调试：记录配对结果
             num_paired = len(paired_text)
             # if self.trainer.is_global_zero and batch_idx % 50 == 0:
-            rank_zero_info(
-                f"[Distill ITC Pairing] total_images={total_images} "
-                f"empty_targets={empty_targets} out_of_range={out_of_range} "
-                f"num_paired={num_paired} text_features_size={text_features.shape[0]}"
-            )
+            # rank_zero_info(
+            #     f"[Distill ITC Pairing] total_images={total_images} "
+            #     f"empty_targets={empty_targets} out_of_range={out_of_range} "
+            #     f"num_paired={num_paired} text_features_size={text_features.shape[0]}"
+            # )
             
             if paired_text:
                 text_embs = torch.stack(paired_text)
@@ -376,10 +376,10 @@ class LightningModule(lightning.LightningModule):
                 
                 # 调试：记录 ITC loss 值
                 # if self.trainer.is_global_zero and batch_idx % 50 == 0:
-                rank_zero_info(
-                    f"[Distill ITC Loss] value={itc_loss.item():.6f} "
-                    f"temperature={self.distill_temperature} weight={self.distill_itc_weight}"
-                )
+                # rank_zero_info(
+                #     f"[Distill ITC Loss] value={itc_loss.item():.6f} "
+                #     f"temperature={self.distill_temperature} weight={self.distill_itc_weight}"
+                # )
             else:
                 # 调试：警告配对失败
                 # if self.trainer.is_global_zero and batch_idx % 50 == 0:

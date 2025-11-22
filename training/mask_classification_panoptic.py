@@ -628,8 +628,8 @@ class MaskClassificationPanoptic(LightningModule):
                 self._stage_best_metric,
                 self._resolve_stage_best_ckpt_path(),
             )
-        if self.stage_is_a:
-            self._run_stage_a_calibration()
+        # if self.stage_is_a:
+        #     self._run_stage_a_calibration()
 
     # ------------------------------------------------------------------
     # Stage A calibration utilities

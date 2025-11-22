@@ -134,7 +134,7 @@ TRAINER:
 
 LOGGING:
   WANDB:
-    ENABLED: false
+    ENABLED: true
     PROJECT: "eomt"
     ENTITY: null
     GROUP: null
