@@ -231,6 +231,10 @@ class LightningModule(lightning.LightningModule):
         open_vocab_logits_per_block = outputs.get("open_vocab_logits")
         text_priors_per_block = outputs.get("open_vocab_sims")
 
+        seen_mask = None
+        if targets and all("seen_mask" in tgt for tgt in targets):
+            seen_mask = [tgt["seen_mask"] for tgt in targets]
+
         # 初始化损失字典
         losses_all_blocks = {}
 
@@ -254,6 +258,7 @@ class LightningModule(lightning.LightningModule):
                 targets=targets,
                 open_vocab_logits=ov_logits,
                 text_priors=text_priors,
+                seen_mask=seen_mask,
             )
             if i != len(mask_logits_per_block) - 1:
                 aux_weight = getattr(self, "aux_weight", 1.0)

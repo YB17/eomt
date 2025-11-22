@@ -48,6 +48,9 @@ class MaskClassificationPanoptic(LightningModule):
         overlap_thresh: float = 0.8,
         open_vocab_kl_weight: float = 0.0,
         open_vocab_kl_temperature: float = 2.0,
+        open_vocab_kl_seen_only: bool = False,
+        open_vocab_kl_top_p: Optional[float] = None,
+        open_vocab_kl_top_k: Optional[int] = None,
         matcher_weights: Optional[Dict[str, Any]] = None,
         aux_weight: float = 0.3,
         stage_config: Optional[Dict[str, Any]] = None,
@@ -132,6 +135,9 @@ class MaskClassificationPanoptic(LightningModule):
             open_vocab_enabled=self.open_vocab_enabled,
             open_vocab_kl_weight=open_vocab_kl_weight,
             open_vocab_kl_teacher_temp=open_vocab_kl_temperature,
+            open_vocab_kl_seen_only=open_vocab_kl_seen_only,
+            open_vocab_kl_top_p=open_vocab_kl_top_p,
+            open_vocab_kl_top_k=open_vocab_kl_top_k,
             matcher_weights=matcher_weights,
         )
 
@@ -195,7 +201,7 @@ class MaskClassificationPanoptic(LightningModule):
         return name.startswith("network.mask_head") or name.startswith("network.class_head") or name.startswith("network.open_vocab_head")
 
     def _stage_b_param_split(self):
-        heads, norm_bias, others, lora = [], [], [], []
+        heads, others, lora = [], [], []
         for name, param in self.named_parameters():
             if not param.requires_grad:
                 continue
@@ -206,15 +212,14 @@ class MaskClassificationPanoptic(LightningModule):
                 heads.append((name, param))
                 continue
             if name.endswith(".bias") or name.split(".")[-1] == "bias" or "norm" in name.lower():
-                norm_bias.append((name, param))
+                heads.append((name, param))
                 continue
             others.append((name, param))
-        return heads, norm_bias, others, lora
+        return heads, others, lora
 
-    def _log_stage_b_param_stats(self, heads, norm_bias, others, lora):
+    def _log_stage_b_param_stats(self, heads, others, lora):
         counts = [
             ("heads", sum(p.numel() for _, p in heads)),
-            ("norm_bias", sum(p.numel() for _, p in norm_bias)),
             ("others", sum(p.numel() for _, p in others)),
             ("lora", sum(p.numel() for _, p in lora)),
         ]
@@ -222,15 +227,13 @@ class MaskClassificationPanoptic(LightningModule):
         if total == 0:
             return
         rank_zero_info(
-            "StageB param split | heads=%d (%.2f%%) norm_bias=%d (%.2f%%) others=%d (%.2f%%) lora=%d (%.2f%%)",
+            "StageB param split | heads=%d (%.2f%%) others=%d (%.2f%%) lora=%d (%.2f%%)",
             counts[0][1],
             100.0 * counts[0][1] / total,
             counts[1][1],
             100.0 * counts[1][1] / total,
             counts[2][1],
             100.0 * counts[2][1] / total,
-            counts[3][1],
-            100.0 * counts[3][1] / total,
         )
 
     def _configure_stage_a_optim(self):
@@ -287,18 +290,17 @@ class MaskClassificationPanoptic(LightningModule):
             )
 
     def _configure_stage_b_optim(self):
-        heads, norm_bias, others, lora = self._stage_b_param_split()
+        heads, others, lora = self._stage_b_param_split()
         self._assert_stage_b_backbone_freeze()
         if not lora:
-            raise RuntimeError("Stage B expects trainable LoRA parameters")
-        self._log_stage_b_param_stats(heads, norm_bias, others, lora)
+            rank_zero_info("StageB running without trainable LoRA parameters.")
+        self._log_stage_b_param_stats(heads, others, lora)
 
         optim_groups = []
-        combined_no_wd = heads + norm_bias
-        if combined_no_wd:
+        if heads:
             optim_groups.append(
                 {
-                    "params": [p for _, p in combined_no_wd],
+                    "params": [p for _, p in heads],
                     "lr": self.stage_head_lr,
                     "weight_decay": self.stage_wd_head,
                 }
@@ -311,16 +313,17 @@ class MaskClassificationPanoptic(LightningModule):
                     "weight_decay": self.stage_wd_other,
                 }
             )
-        optim_groups.append(
-            {
-                "params": [p for _, p in lora],
-                "lr": self.stage_lora_lr,
-                "weight_decay": self.stage_wd_lora,
-            }
-        )
+        if lora:
+            optim_groups.append(
+                {
+                    "params": [p for _, p in lora],
+                    "lr": self.stage_lora_lr,
+                    "weight_decay": self.stage_wd_lora,
+                }
+            )
 
         rank_zero_info(
-            "StageB optim groups | heads+norm lr=%.2e wd=%.3f | others lr=%.2e wd=%.3f | lora lr=%.2e wd=%.3f",
+            "StageB optim groups | heads lr=%.2e wd=%.3f | others lr=%.2e wd=%.3f | lora lr=%.2e wd=%.3f",
             self.stage_head_lr,
             self.stage_wd_head,
             self.stage_other_lr,

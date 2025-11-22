@@ -1,0 +1,130 @@
+STAGE: "B"
+EPOCHS: 2
+GLOBAL_BATCH_SIZE: 48
+BACKBONE_FREEZE: true
+USE_LORA: false
+SEED: 3407
+RESUME_FROM_STAGE_A: "/home/dockeruser/ybai_ws/eomt/runs/coco_eomt_siglip2_ov/stageA/logs/version_32/checkpoints/last.ckpt"
+
+RESOLUTION:
+  PRESET: "Safe"
+  SAFE:
+    SHORT_EDGE: [512, 512]
+    LONG_EDGE_MAX: 512
+    CROP_SIZES: [512]
+    COLOR_JITTER: true
+    FLIP_PROB: 0.5
+
+DATA:
+  DATASET: coco_panoptic
+  ROOT: "/home/host/coco"
+  TRAIN_SPLIT: train2017
+  VAL_SPLIT: val2017
+  TRAIN_RES_MAX: 512
+  BATCH_SIZE: 6
+  NUM_WORKERS: 8
+  PIN_MEMORY: true
+  PERSISTENT_WORKERS: true
+  CHECK_EMPTY_TARGETS: true
+  OPEN_VOCAB_SPLIT: "ovp_val"
+
+ANNEAL:
+  ENABLED: true
+  L2_BLOCKS: 4
+  FACTOR: 0.9
+
+SOLVER:
+  OPTIM: AdamW
+  LR_HEAD: 3.5e-4
+  LR_OTHER: 3.0e-4
+  LR_LORA: 3.0e-4
+  WD_HEAD: 0.0
+  WD_OTHER: 0.05
+  WD_LORA: 0.05
+  BETAS: [0.9, 0.98]
+  CLIP_GRAD: 1.0
+  EPOCHS: 2
+  WARMUP_RATIO: 0.08
+  LR_SCHEDULE: "cosine"
+
+LOSS:
+  MATCH:
+    LAMBDA_MASK_IOU: 2.0
+    LAMBDA_BCE: 1.0
+    LAMBDA_CLS: 0.0
+  SEG:
+    LAMBDA_BCE: 2.0
+    LAMBDA_DICE: 1.0
+  OV:
+    KL_TEXT_WEIGHT: 0.2
+    KL_TEMPERATURE: 3.0
+    CE_WEIGHT: 0.0
+  AUX:
+    WEIGHT: 0.3
+  DISTILL:
+    FEAT_ALIGN: 0.0025
+    ITC_WEIGHT: 0.08
+    TEMPERATURE: 0.07
+
+MODEL:
+  BACKBONE:
+    NAME: ViT-B-16-SigLIP2-512
+    MODEL_ID: "/home/host/siglip2/"
+    DROP_PATH: 0.1
+    NAFLEX: false
+    FREEZE: true
+    FP16: false
+    LORA:
+      ENABLED: false
+      TOTAL_LAYERS: 12
+      LAST_N_LAYERS: 0
+      INCLUDE_PROJ: true
+      DROPOUT: 0.05
+      BIAS: "none"
+  HEAD:
+    TYPE: EoMT
+    NUM_QUERIES: 150
+    NUM_BLOCKS: 4
+    MASK_PROJ_DIM: 768
+    QUERY_INIT: "text+learnable"
+    MASKED_ATTN: true
+  OPEN_VOCAB:
+    ENABLED: true
+    TEXT_MODEL_ID: "/home/host/siglip2/"
+    MULTILINGUAL: false
+    TEMP: 0.07
+    CALIBRATION_BIAS: 0.0
+    ENERGY_REJECT_THR: -inf
+    PER_CLASS_BIAS: "auto"
+    KL_SEEN_ONLY: true
+    KL_TOP_P: 0.9
+
+EVAL:
+  INTERVAL_EPOCHS: 1
+  MIN_MASK_SCORE: 0.25
+  MIN_AREA: 256
+  PQ_METRICS: ["PQ_all", "PQ_things", "PQ_stuff"]
+
+TRAINER:
+  PRECISION: "16-mixed"
+  DEVICES: 8
+  NUM_NODES: 1
+  ACCELERATOR: "gpu"
+  STRATEGY: "ddp_find_unused_parameters_true"
+  SYNC_BATCHNORM: true
+  LIMIT_VAL_BATCHES: null
+  VAL_CHECK_INTERVAL: 1.0
+
+LOGGING:
+  WANDB:
+    ENABLED: true
+    PROJECT: "eomt"
+    ENTITY: null
+    GROUP: null
+    NAME: "stageB0_siglip2"
+    TAGS: ["stageB0", "SigLIP2"]
+    MODE: online
+    RESUME: never
+
+OUTPUT_DIR: "runs/coco_siglip2_ov/stageB0"
+STAGE_BEST_CKPT: "stageB_best.ckpt"
